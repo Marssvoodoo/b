@@ -28,6 +28,19 @@ public class CPHInline
     // Accounts younger than this (in days) are treated as "new" for spam weighting.
     private const int NEW_ACCOUNT_DAYS = 14;
 
+    // ---- Weighted-score ladder (AGGRESSIVE preset) ----
+    // Each signal contributes points; the total decides the action. Tune freely.
+    //   score >= BAN_THRESHOLD     -> delete + ban
+    //   score >= TIMEOUT_THRESHOLD -> delete + timeout
+    //   score >= DELETE_THRESHOLD  -> delete only
+    //   below DELETE_THRESHOLD     -> allow
+    // High-confidence scam combos are worth HARD points so they cross BAN on their own.
+    private const int DELETE_THRESHOLD  = 3;
+    private const int TIMEOUT_THRESHOLD = 5;
+    private const int BAN_THRESHOLD     = 8;
+    private const int TIMEOUT_SECONDS   = 600;  // 10-minute timeout
+    private const int HARD              = 100;  // points for an instant-ban combo
+
     public bool Execute()
     {
         string platform = GetArg("platform", "");
@@ -313,10 +326,6 @@ public class CPHInline
             (addMeDiscordPhrase || ConnectOnDiscordPhrase(norm)) &&
             (complimentChannelWords || supportStayConnectedWords);
 
-        // Wall-of-text + a real Discord handle (not just the word "discord").
-        bool discordWallOfText =
-            discordSignal && isWallOfText;
-
         bool playTogetherWords =
             HasAny(norm,
                 "let's play together", "lets play together", "play together",
@@ -501,97 +510,181 @@ public class CPHInline
             + " | lightSpamSignal=" + lightSpamSignal
             + " | newAccountSpam=" + newAccountSpam);
 
-        // ---- Combine into shouldBan ----
+        // ---- Weighted scoring ----
+        //
+        // Every signal adds points. High-confidence scam combos are worth HARD points
+        // so they alone cross the ban threshold; weaker signals accumulate so several
+        // mild cues together still escalate. The total maps to delete / timeout / ban.
 
-        bool shouldBan =
-            // Instant ban
-            isInstantBanLength ||
+        System.Text.StringBuilder sb = new System.Text.StringBuilder();
+        int score = 0;
 
-            // Standard pattern detections
-            buyViewersCore ||
-            newAccountSpam ||
-            fakeStreamerDiscordSupport ||
-            (designerCore && (contactFunnel || hasLink)) ||
-            artworkPitchSoft ||
-            viewersPlusLink ||
-            monetizationScam ||
-            discordLoveScam ||
-            discordTipsScam ||
-            discordComplimentSupportScam ||
-            discordFanSupportScam ||
-            discordWallOfText ||
-            discordPlayConnectScam ||
-            streamPromoBot ||
-            identityBaitLivePromo ||
-            influencerReferralScam ||
-            directGrowthReferralScam ||
+        // High-confidence combos -> effectively instant ban
+        score += AddSig(sb, isInstantBanLength,                      HARD, "instantLen");
+        score += AddSig(sb, buyViewersCore,                          HARD, "buyViewers");
+        score += AddSig(sb, monetizationScam,                        HARD, "monetizationScam");
+        score += AddSig(sb, artworkPitchSoft,                        HARD, "artworkPitchSoft");
+        score += AddSig(sb, designerCore && (contactFunnel || hasLink), HARD, "designerContact");
+        score += AddSig(sb, viewersPlusLink,                         HARD, "viewersPlusLink");
+        score += AddSig(sb, discordLoveScam,                         HARD, "discordLove");
+        score += AddSig(sb, discordTipsScam,                         HARD, "discordTips");
+        score += AddSig(sb, discordComplimentSupportScam,            HARD, "discordComplimentSupport");
+        score += AddSig(sb, discordFanSupportScam,                   HARD, "discordFanSupport");
+        score += AddSig(sb, discordPlayConnectScam,                  HARD, "discordPlayConnect");
+        score += AddSig(sb, fakeStreamerDiscordSupport,              HARD, "fakeStreamerDiscord");
+        score += AddSig(sb, streamPromoBot,                          HARD, "streamPromoBot");
+        score += AddSig(sb, identityBaitLivePromo,                   HARD, "identityBaitLive");
+        score += AddSig(sb, influencerReferralScam,                  HARD, "influencerReferral");
+        score += AddSig(sb, directGrowthReferralScam,                HARD, "directGrowthReferral");
+        score += AddSig(sb, newAccountSpam,                          HARD, "newAccountSpam");
 
-            // Wall-of-text + signal
-            (isWallOfText && contactFunnel) ||
-            (isWallOfText && hasLink) ||
-            (isWallOfText && bigAccountClaim) ||
-            (isWallOfText && monetizationWords) ||
-            (isWallOfText && exposureWords && streamerTargeting) ||
+        // Weak / medium signals that accumulate
+        score += AddSig(sb, hasLink,                                 3, "link");
+        score += AddSig(sb, discordSignal,                           2, "discord");
+        score += AddSig(sb, discordHandlePattern || likelyDiscordUsernameNearby, 2, "discordHandle");
+        score += AddSig(sb, contactFunnel,                           3, "contactFunnel");
+        score += AddSig(sb, bigAccountClaim,                         3, "bigAccount");
+        score += AddSig(sb, monetizationWords,                       2, "monetizationWords");
+        score += AddSig(sb, exposureWords,                           2, "exposureWords");
+        score += AddSig(sb, streamerTargeting,                       1, "streamerTargeting");
+        score += AddSig(sb, newStreamerExploit,                      2, "newStreamerExploit");
+        score += AddSig(sb, proposalWords,                           1, "proposal");
+        score += AddSig(sb, artServiceWords,                         3, "artService");
+        score += AddSig(sb, selfPromoLive,                           3, "selfPromoLive");
+        score += AddSig(sb, identityBait,                            2, "identityBait");
+        score += AddSig(sb, growthPitch,                             2, "growthPitch");
+        score += AddSig(sb, referralCloser,                          2, "referralCloser");
+        score += AddSig(sb, loveBombCompliment,                      2, "loveBomb");
+        score += AddSig(sb, complimentChannelWords,                  1, "complimentChannel");
+        score += AddSig(sb, supportStayConnectedWords,               1, "supportConnected");
+        score += AddSig(sb, addMeDiscordPhrase,                      3, "addMeDiscord");
+        score += AddSig(sb, hitMeUpDiscord,                          2, "hitMeUpDiscord");
+        score += AddSig(sb, tipsOrSquadPattern,                      1, "tipsSquad");
+        score += AddSig(sb, playTogetherWords,                       1, "playTogether");
+        score += AddSig(sb, connectOnDiscord,                        2, "connectDiscord");
+        score += AddSig(sb, isSuspiciousLength,                      1, "suspLen");
+        score += AddSig(sb, isWallOfText,                            2, "wall");
+        score += AddSig(sb, newOrFirst,                              2, "newOrFirst");
 
-            // Suspicious length + layered weak signals
-            (isSuspiciousLength && bigAccountClaim && (growthPitch || addOnDiscordReferral)) ||
-            (isSuspiciousLength && discordSignal && referralCloser);
+        // ---- Map score to an action ----
+        int action = 0;            // 0 allow, 1 delete, 2 timeout, 3 ban
+        string actionName = "allow";
+        if (score >= BAN_THRESHOLD)          { action = 3; actionName = "BAN"; }
+        else if (score >= TIMEOUT_THRESHOLD) { action = 2; actionName = "TIMEOUT"; }
+        else if (score >= DELETE_THRESHOLD)  { action = 1; actionName = "DELETE"; }
 
-        CPH.LogInfo("[SpamFilter] shouldBan=" + shouldBan
-            + " | instantBanLen=" + isInstantBanLength
-            + " | newAccountSpam=" + newAccountSpam
-            + " | wall=" + isWallOfText
-            + " | discordWall=" + discordWallOfText
-            + " | monetizationScam=" + monetizationScam
-            + " | discordFanSupport=" + discordFanSupportScam
-            + " | influencerReferral=" + influencerReferralScam
-            + " | directGrowthReferral=" + directGrowthReferralScam
-            + " | fakeStreamerDiscordSupport=" + fakeStreamerDiscordSupport);
+        CPH.LogInfo("[SpamFilter] score=" + score + " | action=" + actionName
+            + " | thresholds d/t/b=" + DELETE_THRESHOLD + "/" + TIMEOUT_THRESHOLD + "/" + BAN_THRESHOLD
+            + " | signals: " + sb.ToString());
 
-        if (!shouldBan)
+        if (action == 0)
             return true;
 
-        // Delete message even if username is blank
-        if (IsBlank(userName))
+        string reason = "Spam detected (auto, score " + score + ")";
+
+        // Delete-only, or no username to act on -> just remove the message.
+        if (action == 1 || IsBlank(userName))
         {
-            bool deletedNoUser = false;
-
-            try
-            {
-                if (!IsBlank(msgId))
-                    deletedNoUser = CPH.TwitchDeleteChatMessage(msgId, false);
-            }
-            catch (Exception ex)
-            {
-                CPH.LogInfo("[SpamFilter] Twitch delete error (blank user): " + ex.Message);
-            }
-
-            CPH.LogInfo("[SpamFilter] Deleted spam message with blank username | deleted=" + deletedNoUser + " | msgId=" + msgId);
+            bool deleted = TryDeleteMessage(msgId);
+            CPH.LogInfo("[SpamFilter] " + (action == 1 ? "DELETE" : actionName + " wanted but username blank; delete-only")
+                + " | user=" + userName + " | deleted=" + deleted + " | msgId=" + msgId);
             return true;
         }
 
-        CPH.LogInfo("[SpamFilter] BANNING " + userName);
-        ExecuteTwitchBan(userName, msgId, "Spam detected (auto)");
+        if (action == 2)
+        {
+            CPH.LogInfo("[SpamFilter] TIMEOUT " + userName + " (" + TIMEOUT_SECONDS + "s)");
+            ExecuteTwitchTimeout(userName, msgId, TIMEOUT_SECONDS, reason);
+        }
+        else
+        {
+            CPH.LogInfo("[SpamFilter] BANNING " + userName);
+            ExecuteTwitchBan(userName, msgId, reason);
+        }
 
         return true;
     }
 
-    // --------- Twitch ban executor ---------
-
-    private void ExecuteTwitchBan(string userName, string msgId, string reason)
+    // Adds points to the running total and records the signal name when present.
+    private int AddSig(System.Text.StringBuilder sb, bool cond, int pts, string name)
     {
-        bool deleted = false;
-        bool banned  = false;
+        if (!cond) return 0;
+        sb.Append(name).Append("(+").Append(pts).Append(") ");
+        return pts;
+    }
 
+    // --------- Twitch action executors ---------
+
+    private bool TryDeleteMessage(string msgId)
+    {
         try
         {
             if (!IsBlank(msgId))
-                deleted = CPH.TwitchDeleteChatMessage(msgId, false);
+                return CPH.TwitchDeleteChatMessage(msgId, false);
         }
         catch (Exception ex)
         {
             CPH.LogInfo("[SpamFilter] Twitch delete error: " + ex.Message);
         }
+
+        return false;
+    }
+
+    private void ExecuteTwitchTimeout(string userName, string msgId, int seconds, string reason)
+    {
+        bool deleted   = TryDeleteMessage(msgId);
+        bool timedOut  = InvokeTimeout(userName, seconds, reason);
+
+        CPH.LogInfo("[SpamFilter] timeout=" + timedOut
+            + " | seconds=" + seconds
+            + " | delete=" + deleted
+            + " | user=" + userName
+            + " | msgId=" + msgId
+            + " | reason=" + reason);
+    }
+
+    // Timeout via reflection so it compiles regardless of which TwitchTimeoutUser
+    // overload this Streamer.bot version exposes; falls back through shorter signatures.
+    private bool InvokeTimeout(string userName, int seconds, string reason)
+    {
+        try
+        {
+            Type ct = CPH.GetType();
+
+            MethodInfo m = ct.GetMethod("TwitchTimeoutUser",
+                new Type[] { typeof(string), typeof(int), typeof(string), typeof(bool) });
+            if (m != null)
+                return ToBool(m.Invoke(CPH, new object[] { userName, seconds, reason, false }));
+
+            m = ct.GetMethod("TwitchTimeoutUser",
+                new Type[] { typeof(string), typeof(int), typeof(string) });
+            if (m != null)
+                return ToBool(m.Invoke(CPH, new object[] { userName, seconds, reason }));
+
+            m = ct.GetMethod("TwitchTimeoutUser",
+                new Type[] { typeof(string), typeof(int) });
+            if (m != null)
+                return ToBool(m.Invoke(CPH, new object[] { userName, seconds }));
+
+            CPH.LogInfo("[SpamFilter] TwitchTimeoutUser not found; cannot timeout " + userName);
+        }
+        catch (Exception ex)
+        {
+            CPH.LogInfo("[SpamFilter] Twitch timeout error: " + ex.Message);
+        }
+
+        return false;
+    }
+
+    private bool ToBool(object o)
+    {
+        return o is bool ? (bool)o : true;
+    }
+
+    private void ExecuteTwitchBan(string userName, string msgId, string reason)
+    {
+        bool deleted = TryDeleteMessage(msgId);
+        bool banned  = false;
 
         try
         {
