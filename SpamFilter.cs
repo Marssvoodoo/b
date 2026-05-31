@@ -1,4 +1,6 @@
 using System;
+using System.Globalization;
+using System.Reflection;
 using System.Text.RegularExpressions;
 
 public class CPHInline
@@ -22,6 +24,9 @@ public class CPHInline
     private const int LENGTH_SUSPICIOUS  = 200;
     private const int LENGTH_WALL        = 350;
     private const int LENGTH_INSTANT_BAN = 500;
+
+    // Accounts younger than this (in days) are treated as "new" for spam weighting.
+    private const int NEW_ACCOUNT_DAYS = 14;
 
     public bool Execute()
     {
@@ -463,6 +468,39 @@ public class CPHInline
 
         bool identityBaitLivePromo = identityBait && selfPromoLive;
 
+        // ---- New-account / first-message weighting ----
+        //
+        // A user's first-ever message, or a message from a very new account, is the
+        // single strongest spam tell. Twitch passes the first-message flag directly.
+        // Account age is read from args if a preceding "Get User Info" sub-action set
+        // them; otherwise it is looked up via the Twitch API (best-effort, reflection-
+        // based so it compiles on any Streamer.bot version and never throws fatally).
+
+        bool isFirstMessage =
+            GetArgBool("isFirstMessage") || GetArgBool("firstMessage") ||
+            GetArgBool("firstTimeChatter") || GetArgBool("isFirstChat");
+
+        string userId = GetArg("userId", GetArg("userid", GetArg("userID", "")));
+        double accountAgeDays = GetAccountAgeDays(userId, userName);
+
+        bool isNewAccount = accountAgeDays >= 0 && accountAgeDays <= NEW_ACCOUNT_DAYS;
+        bool newOrFirst   = isFirstMessage || isNewAccount;
+
+        // Signals that are individually too weak to ban on, but are damning when they
+        // arrive in a user's first message or from a brand-new account.
+        bool lightSpamSignal =
+            hasLink || discordSignal || contactFunnel ||
+            bigAccountClaim || artServiceWords ||
+            (monetizationWords && exposureWords);
+
+        bool newAccountSpam = newOrFirst && lightSpamSignal;
+
+        CPH.LogInfo("[SpamFilter] firstMessage=" + isFirstMessage
+            + " | accountAgeDays=" + (accountAgeDays < 0 ? "unknown" : accountAgeDays.ToString("0"))
+            + " | isNewAccount=" + isNewAccount
+            + " | lightSpamSignal=" + lightSpamSignal
+            + " | newAccountSpam=" + newAccountSpam);
+
         // ---- Combine into shouldBan ----
 
         bool shouldBan =
@@ -471,6 +509,7 @@ public class CPHInline
 
             // Standard pattern detections
             buyViewersCore ||
+            newAccountSpam ||
             fakeStreamerDiscordSupport ||
             (designerCore && (contactFunnel || hasLink)) ||
             artworkPitchSoft ||
@@ -500,6 +539,7 @@ public class CPHInline
 
         CPH.LogInfo("[SpamFilter] shouldBan=" + shouldBan
             + " | instantBanLen=" + isInstantBanLength
+            + " | newAccountSpam=" + newAccountSpam
             + " | wall=" + isWallOfText
             + " | discordWall=" + discordWallOfText
             + " | monetizationScam=" + monetizationScam
@@ -675,6 +715,96 @@ public class CPHInline
         return false;
     }
 
+    // Returns the account age in days, or -1 if it cannot be determined.
+    private double GetAccountAgeDays(string userId, string userLogin)
+    {
+        // 1) Explicit args (e.g. set by a preceding "Get User Info" sub-action).
+        double argAge = ParseDouble(GetArg("accountAgeDays", GetArg("accountAge", "")));
+        if (argAge >= 0) return argAge;
+
+        DateTime created;
+        if (TryParseDate(GetArg("accountCreated", GetArg("createdAt", GetArg("targetCreatedAt", ""))), out created))
+            return (DateTime.UtcNow - created.ToUniversalTime()).TotalDays;
+
+        // 2) Best-effort API lookup via reflection. This never references a method or
+        //    return type that might be missing in this Streamer.bot version, so the
+        //    script always compiles; if the call isn't available it simply returns -1.
+        try
+        {
+            object info = InvokeCph("TwitchGetExtendedUserInfoById", userId)
+                       ?? InvokeCph("TwitchGetExtendedUserInfoByLogin", userLogin);
+
+            if (info != null)
+            {
+                DateTime? c = ReadDateProperty(info,
+                    "Created", "AccountCreated", "CreatedAt", "AccountCreatedAt",
+                    "UserCreated", "CreatedAtRfc3339");
+                if (c.HasValue)
+                    return (DateTime.UtcNow - c.Value.ToUniversalTime()).TotalDays;
+            }
+        }
+        catch (Exception ex)
+        {
+            CPH.LogInfo("[SpamFilter] account-age lookup skipped: " + ex.Message);
+        }
+
+        return -1; // unknown -> account-age weighting stays inactive
+    }
+
+    private object InvokeCph(string method, string arg)
+    {
+        if (IsBlank(arg)) return null;
+        try
+        {
+            MethodInfo m = CPH.GetType().GetMethod(method, new Type[] { typeof(string) });
+            if (m == null) return null;
+            return m.Invoke(CPH, new object[] { arg });
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private DateTime? ReadDateProperty(object obj, params string[] names)
+    {
+        Type t = obj.GetType();
+        for (int i = 0; i < names.Length; i++)
+        {
+            PropertyInfo p = t.GetProperty(names[i]);
+            if (p == null) continue;
+
+            object v = p.GetValue(obj, null);
+            if (v == null) continue;
+
+            if (v is DateTime) return (DateTime)v;
+            if (v is DateTimeOffset) return ((DateTimeOffset)v).UtcDateTime;
+
+            DateTime parsed;
+            if (TryParseDate(v.ToString(), out parsed)) return parsed;
+        }
+
+        return null;
+    }
+
+    private bool TryParseDate(string s, out DateTime dt)
+    {
+        dt = default(DateTime);
+        if (IsBlank(s)) return false;
+
+        return DateTime.TryParse(s, CultureInfo.InvariantCulture,
+            DateTimeStyles.AdjustToUniversal | DateTimeStyles.AssumeUniversal, out dt);
+    }
+
+    private double ParseDouble(string s)
+    {
+        double d;
+        if (!IsBlank(s) && double.TryParse(s, NumberStyles.Any, CultureInfo.InvariantCulture, out d))
+            return d;
+
+        return -1;
+    }
+
     private bool Has(string hay, string needle)
     {
         return hay.IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0;
@@ -704,13 +834,13 @@ public class CPHInline
         string t = (s ?? "").ToLowerInvariant().Normalize(System.Text.NormalizationForm.FormKC);
 
         // Strip zero-width / invisible chars
-        t = Regex.Replace(t, @"[​-‏﻿]", "");
+        t = Regex.Replace(t, @"[\u200B-\u200F\uFEFF]", "");
 
         // Strip all surrogate-pair emoji
         t = Regex.Replace(t, @"[\uD800-\uDFFF]", "");
 
         // Strip common single-codepoint emoji/arrows below U+FFFF
-        t = Regex.Replace(t, @"[☀-⟿⬀-⯿︀-️]", "");
+        t = Regex.Replace(t, @"[\u2600-\u27FF\u2B00-\u2BFF\uFE00-\uFE0F]", "");
 
         // Replace leftover weird symbols/punctuation with spaces, keep useful URL/handle chars
         t = Regex.Replace(t, @"[^\w\s\.\-:@/]", " ");
