@@ -26,6 +26,9 @@
          v1.2.1: repair now starts with per-user registration of the staged
          App Installer package (Add-AppxPackage -Register), since provisioned
          MSIX packages only register at logon and SYSTEM never logs on.
+         v1.2.2: registration is skipped under SYSTEM (Windows rejects it
+         with 0x80073CF9); final fallback extracts the App Installer bundle
+         to C:\drop\citrix\winget-portable and runs winget unpackaged.
       3. Optional SHA-256 verification (-ExpectedSha256).
       4. Kill running Citrix processes (they block silent reinstall).
       5. Run: CitrixWorkspaceApp.exe /silent /forceinstall /noreboot
@@ -69,8 +72,14 @@
 
 .NOTES
     Author  : MEB -- Oak Street Health / CVS Health IT Operations
-    Version : 1.2.1
+    Version : 1.2.2
     Date    : 2026-07-14
+    v1.2.2  : Field fix #2 from OSHCGHL0X54: Windows hard-blocks LocalSystem
+              from Appx Register (0x80073CF9), so registration is now skipped
+              under SYSTEM, and a new final fallback extracts the downloaded
+              App Installer msixbundle (a zip) into C:\drop\citrix\
+              winget-portable and runs that winget.exe as a plain Win32
+              process -- no package identity, immune to the restriction.
     v1.2.1  : Fix winget repair on boxes where App Installer is already
               provisioned (DISM no-ops): provisioned MSIX packages only
               register per-user at logon and SYSTEM never logs on, so now
@@ -102,7 +111,7 @@ param(
     [switch]$DryRun
 )
 
-$ScriptVersion    = '1.2.1'
+$ScriptVersion    = '1.2.2'
 $DestinationFolder = 'C:\drop\citrix'
 $LogRetainDays    = 30
 $TimeoutSentinel  = 99001
@@ -146,6 +155,10 @@ function Test-IsAdmin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
         [Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Test-IsSystem {
+    ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value -eq 'S-1-5-18'
 }
 
 function Get-InstalledCitrixVersion {
@@ -310,10 +323,20 @@ function Invoke-WingetProcess {
 # v1.2.0: winget runtime self-heal (fixes 0xC0000135 under SYSTEM)
 # ---------------------------------------------------------------------------
 $script:WingetRepairAttempted = $false
+$script:WingetExeOverride     = $null   # set when a portable extraction succeeds
+
+function Get-WingetExe {
+    # Portable copy (from a successful repair) wins over the packaged install.
+    if ($script:WingetExeOverride -and (Test-Path -LiteralPath $script:WingetExeOverride)) {
+        return $script:WingetExeOverride
+    }
+    return Resolve-WingetPath
+}
 
 function Test-WingetOperational {
-    # Re-resolve (repairs can land in a new version folder) and probe.
-    $wg = Resolve-WingetPath
+    # Re-resolve (repairs can land in a new version folder or the portable
+    # directory) and probe.
+    $wg = Get-WingetExe
     if (-not $wg) { return $false }
     $script:WingetDir = Split-Path -Path $wg -Parent
     return ((Invoke-WingetProcess -WingetExe $wg -Arguments '--version' -TimeoutSecondsLocal 120) -eq 0)
@@ -325,6 +348,13 @@ function Register-WingetForCurrentUser {
     # already on disk and per-user registration is the only missing piece.
     # Registering the App Installer manifest for the invoking account also
     # pulls in its staged framework dependencies (VCLibs/UI.Xaml).
+    if (Test-IsSystem) {
+        # v1.2.2: Windows rejects Appx Register for LocalSystem outright
+        # (0x80073CF9, "Local System account is not allowed"). Don't burn 5s
+        # on a guaranteed failure; the portable fallback covers SYSTEM.
+        Write-Log 'Skipping per-user Appx registration: Windows blocks LocalSystem from Register (0x80073CF9).'
+        return $false
+    }
     $wg = Resolve-WingetPath
     if (-not $wg) { return $false }
     $manifest = Join-Path (Split-Path -Path $wg -Parent) 'AppxManifest.xml'
@@ -371,7 +401,17 @@ function Repair-WingetRuntime {
             & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $standalone -SkipModuleRepair
             $rc = $LASTEXITCODE
             Write-Log "Repair-Winget.ps1 exit code: $rc"
-            return ($rc -le 1)   # 0 = healthy, 1 = healthy with warnings
+            if ($rc -gt 1) { return $false }   # 0 = healthy, 1 = healthy with warnings
+            # The sidecar may have fixed the packaged install OR produced a
+            # portable copy; pick up whichever actually works.
+            if (Test-WingetOperational) { return $true }
+            $portable = Join-Path $DestinationFolder 'winget-portable\winget.exe'
+            if (Test-Path -LiteralPath $portable) {
+                $script:WingetExeOverride = $portable
+                if (Test-WingetOperational) { return $true }
+                $script:WingetExeOverride = $null
+            }
+            return $false
         }
     }
 
@@ -427,44 +467,116 @@ function Repair-WingetRuntime {
         if ($pkg.Kind -eq 'main') { $main = $target } else { $deps += $target }
     }
 
+    # Best-effort provisioning: even when it can't help this run (DISM no-ops
+    # on a same-or-newer staged version), it registers winget for interactive
+    # users at their next logon. Never fatal -- the portable fallback below
+    # doesn't need it.
     try {
         Write-Log "Provisioning machine-wide: $main (deps: $($deps -join '; '))"
         Add-AppxProvisionedPackage -Online -PackagePath $main -DependencyPackagePath $deps -SkipLicense -ErrorAction Stop | Out-Null
         Write-Log 'winget runtime provisioned.'
     } catch {
-        Write-Log "Provisioning failed: $($_.Exception.Message)" 'ERROR'
-        # Same-or-higher broken App Installer already staged? Dependencies
-        # alone cure 0xC0000135 when the winget binaries are intact.
+        Write-Log "Provisioning failed: $($_.Exception.Message)" 'WARNING'
         try {
             Write-Log 'Fallback: provisioning dependency packages only...' 'WARNING'
             foreach ($dep in $deps) {
                 Add-AppxProvisionedPackage -Online -PackagePath $dep -SkipLicense -ErrorAction Stop | Out-Null
             }
         } catch {
-            Write-Log "Dependency-only provisioning also failed: $($_.Exception.Message)" 'ERROR'
-            return $false
+            Write-Log "Dependency-only provisioning also failed: $($_.Exception.Message)" 'WARNING'
         }
     }
 
     # Provisioning alone registers per-user only at next logon; register now
-    # for the invoking (SYSTEM) account, then probe.
+    # for the invoking account (no-op under SYSTEM), then probe.
     Start-Sleep -Seconds 5
     Register-WingetForCurrentUser | Out-Null
     if (Test-WingetOperational) {
         Write-Log "winget operational after repair: $($script:WingetDir)"
         return $true
     }
-    Write-Log 'winget still failing after provisioning + registration.' 'ERROR'
+
+    # v1.2.2 final fallback: run winget unpackaged. The msixbundle is a zip;
+    # extracting winget.exe plus the framework DLLs into a plain folder gives
+    # a normal Win32 process with no package identity -- which sidesteps both
+    # 0xC0000135 (DLL resolution) and 0x80073CF9 (LocalSystem Appx block).
+    Write-Log 'Packaged winget still failing; extracting a portable copy (no Appx deployment involved).'
+    $portableExe = New-PortableWinget -BundlePath $main -DependencyPaths $deps
+    if ($portableExe) {
+        $script:WingetExeOverride = $portableExe
+        if (Test-WingetOperational) {
+            Write-Log "Portable winget operational: $portableExe"
+            return $true
+        }
+        $script:WingetExeOverride = $null
+    }
+    Write-Log 'winget still failing after all repair strategies.' 'ERROR'
     return $false
+}
+
+function New-PortableWinget {
+    # Extract the App Installer msixbundle (zip) -> x64 msix (zip) -> flat
+    # folder, then drop the VCLibs/UI.Xaml DLLs beside winget.exe so the
+    # plain Win32 loader finds them. Returns the portable exe path or $null.
+    param(
+        [Parameter(Mandatory)][string]$BundlePath,
+        [Parameter(Mandatory)][string[]]$DependencyPaths
+    )
+    $portableDir = Join-Path $DestinationFolder 'winget-portable'
+    $workDir     = Join-Path $DestinationFolder 'winget-portable-tmp'
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+        foreach ($d in @($portableDir, $workDir)) {
+            if (Test-Path -LiteralPath $d) { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+            New-Item -Path $d -ItemType Directory -Force | Out-Null
+        }
+
+        # Pull the x64 application msix out of the bundle.
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($BundlePath)
+        try {
+            $entry = $zip.Entries | Where-Object { $_.Name -match '(?i)x64.*\.msix$' } | Select-Object -First 1
+            if (-not $entry) {
+                Write-Log 'No x64 msix found inside the App Installer bundle.' 'ERROR'
+                return $null
+            }
+            Write-Log "Extracting from bundle: $($entry.Name)"
+            $msixPath = Join-Path $workDir $entry.Name
+            [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $msixPath, $true)
+        } finally { $zip.Dispose() }
+
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($msixPath, $portableDir)
+
+        # Framework DLLs (msvcp140_app, vcruntime140_app, Microsoft.UI.Xaml)
+        # go beside the exe.
+        foreach ($dep in $DependencyPaths) {
+            $depDir = Join-Path $workDir ([IO.Path]::GetFileNameWithoutExtension($dep))
+            [System.IO.Compression.ZipFile]::ExtractToDirectory($dep, $depDir)
+            Get-ChildItem -LiteralPath $depDir -Filter '*.dll' -Recurse -ErrorAction SilentlyContinue |
+                ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $portableDir -Force }
+        }
+
+        $exe = Join-Path $portableDir 'winget.exe'
+        if (-not (Test-Path -LiteralPath $exe)) {
+            Write-Log 'winget.exe missing after extraction.' 'ERROR'
+            return $null
+        }
+        Write-Log "Portable winget staged: $exe"
+        return $exe
+    } catch {
+        Write-Log "Portable extraction failed: $($_.Exception.Message)" 'ERROR'
+        return $null
+    } finally {
+        Remove-Item -LiteralPath $workDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Get-InstallerViaWinget {
     # Stage the LTSR installer using `winget download`. Returns exe path or $null.
-    $wg = Resolve-WingetPath
+    $wg = Get-WingetExe
     if (-not $wg) {
         Write-Log 'winget.exe not found; attempting to provision it.' 'WARNING'
         if (-not (Repair-WingetRuntime)) { return $null }
-        $wg = Resolve-WingetPath
+        $wg = Get-WingetExe
         if (-not $wg) { return $null }
     }
     $script:WingetDir = Split-Path -Path $wg -Parent
@@ -488,7 +600,7 @@ function Get-InstallerViaWinget {
     if ($code -eq $WingetDllNotFound) {
         Write-Log 'winget download failed with 0xC0000135 (DLL not found under SYSTEM); attempting runtime repair.' 'WARNING'
         if (Repair-WingetRuntime) {
-            $wg = Resolve-WingetPath
+            $wg = Get-WingetExe
             if ($wg) {
                 $script:WingetDir = Split-Path -Path $wg -Parent
                 $code = Invoke-WingetProcess -WingetExe $wg -Arguments $dlArgs -TimeoutSecondsLocal 600
@@ -523,7 +635,7 @@ function Invoke-WingetForceReinstall {
     # Last resort: direct winget install with --force, appending /forceinstall
     # to the installer via --custom so the FTA re-registration pass runs.
     # Returns $true if winget reports success.
-    $wg = Resolve-WingetPath
+    $wg = Get-WingetExe
     if (-not $wg) { return $false }
     $script:WingetDir = Split-Path -Path $wg -Parent
     Write-Log 'Attempting direct winget forced reinstall (install --force --custom "/forceinstall").'
@@ -539,7 +651,7 @@ function Invoke-WingetForceReinstall {
     if ($code -eq $WingetDllNotFound) {
         Write-Log 'winget install failed with 0xC0000135; attempting runtime repair.' 'WARNING'
         if (Repair-WingetRuntime) {
-            $wg = Resolve-WingetPath
+            $wg = Get-WingetExe
             if ($wg) {
                 $script:WingetDir = Split-Path -Path $wg -Parent
                 $code = Invoke-WingetProcess -WingetExe $wg -Arguments $inArgs -TimeoutSecondsLocal $TimeoutSeconds

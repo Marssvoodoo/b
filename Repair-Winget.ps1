@@ -8,47 +8,57 @@
     Root cause this script targets: winget.exe (Microsoft.DesktopAppInstaller)
     launches from C:\Program Files\WindowsApps\... but the loader cannot
     resolve its MSIX framework dependencies (Microsoft.VCLibs.140.00.UWPDesktop
-    and Microsoft.UI.Xaml.2.8) because the installed dependency packages are
-    missing or version-mismatched against the App Installer build that
-    auto-updated onto the box. Symptom: instant exit -1073741515 before winget
-    prints anything, most visible when invoked as SYSTEM.
+    and Microsoft.UI.Xaml.2.8) because the package is not registered for the
+    invoking account and/or the dependency packages are missing. Symptom:
+    instant exit -1073741515 before winget prints anything, most visible when
+    invoked as SYSTEM.
+
+    Field findings baked in (OSHCGHL0X54):
+      - DISM no-ops silently (3s "success") when a same-or-newer App
+        Installer is already provisioned, so provisioning alone proves
+        nothing.
+      - Windows HARD-BLOCKS LocalSystem from Appx Register operations
+        (0x80073CF9 "Local System account is not allowed"), so per-user
+        registration can never fix SYSTEM. The portable extraction below is
+        the reliable cure for SYSTEM context.
 
     Flow:
       1. Initialize logging (C:\drop\citrix, 30-day rotation).
       2. Health probe: resolve winget.exe (PATH, then newest WindowsApps
          package folder) and run `winget --version` with the working
-         directory set to the package folder (the SYSTEM working-dir fix).
-         Healthy + not -Force -> exit 0, nothing touched.
+         directory set to the package folder. Healthy + not -Force -> exit 0.
       3. Strategy 0 -- per-user registration (free, no downloads):
          Add-AppxPackage -Register on the staged App Installer's
-         AppxManifest.xml. Provisioned MSIX packages only register per-user
-         at LOGON, and SYSTEM never logs on -- so on many broken boxes every
-         package is already on disk and registration for the invoking
-         account is the only missing piece. This is the most common cure.
+         AppxManifest.xml. Cures boxes where the packages are staged but
+         unregistered for the invoking account. SKIPPED under SYSTEM
+         (0x80073CF9 -- the OS forbids it).
       4. Strategy A -- Microsoft.WinGet.Client PowerShell module:
          install NuGet provider + module from PSGallery (AllUsers), then
-         Repair-WinGetPackageManager -AllUsers -Force -Latest. This is
-         Microsoft's supported repair path and handles dependency matching
-         itself. Needs PSGallery reachability.
+         Repair-WinGetPackageManager -AllUsers -Force -Latest. Microsoft's
+         supported repair path. Needs PSGallery reachability.
       5. Strategy B -- manual machine-wide provisioning (no PSGallery):
          download Microsoft.VCLibs.x64.14.00.Desktop.appx,
          Microsoft.UI.Xaml.2.8 (x64) and the latest
          Microsoft.DesktopAppInstaller msixbundle (aka.ms/getwinget), then
          Add-AppxProvisionedPackage -Online with the dependencies, followed
-         by per-user registration (provisioning alone only registers at next
-         logon; DISM also no-ops silently when a same-or-newer App Installer
-         is already provisioned).
-      6. Re-probe: re-resolve winget.exe (the repaired install can land in a
-         NEW versioned folder), run `winget --version`, then prime sources
-         with `winget source update` so the first real install doesn't stall
-         on source bootstrap under SYSTEM.
+         by per-user registration (non-SYSTEM). Best effort -- also fixes
+         winget for interactive users at their next logon.
+      6. Strategy C -- portable extraction (the SYSTEM-proof path):
+         the msixbundle is a zip; extract the x64 msix and place the
+         VCLibs/UI.Xaml DLLs beside winget.exe in
+         C:\drop\citrix\winget-portable. That winget runs as a plain Win32
+         process with no package identity -- immune to both 0xC0000135 and
+         the 0x80073CF9 LocalSystem block.
+      7. Verify: probe whichever winget now works (packaged or portable),
+         then prime sources with `winget source update`.
 
     Pair with Reinstall-CitrixLTSR.ps1: run this first (or let that script's
     built-in repair fire), and winget-tier sourcing works fleet-wide.
 
     Exit codes (WS1):
       0 = winget healthy (already, or after repair)
-      1 = repaired with warnings (winget runs; source update failed, etc.)
+      1 = repaired with warnings (winget runs; source update failed, or only
+          the portable copy works)
       2 = repair failed / winget still broken
       3 = unsupported OS (no MSIX app support, e.g. Server 2019 LTSC w/o store)
 
@@ -56,8 +66,9 @@
     Run the repair even if the health probe says winget already works.
 
 .PARAMETER SkipModuleRepair
-    Skip Strategy A (PSGallery module) and go straight to manual provisioning.
-    Use on networks where PSGallery is blocked -- saves ~2 min of timeouts.
+    Skip Strategy A (PSGallery module) and go straight to provisioning +
+    portable extraction. Use on networks where PSGallery is blocked -- saves
+    ~2 min of timeouts.
 
 .PARAMETER TimeoutSeconds
     Per-operation timeout (downloads, winget probes). Default 600.
@@ -67,19 +78,20 @@
 
 .NOTES
     Author  : MEB -- Oak Street Health / CVS Health IT Operations
-    Version : 1.1.0
+    Version : 1.2.0
     Date    : 2026-07-14
+    v1.2.0  : Field fix #2 from OSHCGHL0X54: Windows rejects Appx Register
+              for LocalSystem (0x80073CF9), so Strategy 0 is skipped under
+              SYSTEM and new Strategy C extracts a portable winget from the
+              downloaded msixbundle -- no Appx deployment involved.
     v1.1.0  : Added Strategy 0 (Add-AppxPackage -Register for the invoking
-              account, tried before any download) and post-provisioning
-              registration in Strategy B. Field finding from OSHCGHL0X54:
-              DISM no-ops when a same-or-newer App Installer is already
-              provisioned, and per-user registration was the actual gap.
+              account) and post-provisioning registration in Strategy B.
     v1.0.0  : Initial release.
     Context : NT AUTHORITY\SYSTEM (WS1 Device context) or elevated admin
     PowerShell 5.1 compatible. Logs to C:\drop\citrix.
     Downloads require outbound HTTPS to aka.ms / *.microsoft.com / github.com
-    (Strategy B) and PSGallery (Strategy A). On fully dark networks, provision
-    the three packages from a share instead (see $ManualPackageDir).
+    (Strategies B/C) and PSGallery (Strategy A). On fully dark networks,
+    pre-stage the three packages (see $ManualPackageDir).
 #>
 
 [CmdletBinding()]
@@ -90,15 +102,16 @@ param(
     [switch]$DryRun
 )
 
-$ScriptVersion     = '1.1.0'
+$ScriptVersion     = '1.2.0'
 $DestinationFolder = 'C:\drop\citrix'
 $RepairDir         = Join-Path $DestinationFolder 'winget-repair'
+$PortableDir       = Join-Path $DestinationFolder 'winget-portable'
 $LogRetainDays     = 30
 $WingetDllNotFound = -1073741515
 $TimeoutSentinel   = 99001
 
 # Optional: pre-staged packages (e.g. copied from a share) are used instead of
-# downloading when all three exist here. Names must match the patterns below.
+# downloading when they exist here. Names must match the patterns below.
 $ManualPackageDir  = Join-Path $RepairDir 'staged'
 
 # Dependency/download matrix. UI.Xaml 2.8 is what DesktopAppInstaller 1.22+
@@ -159,10 +172,16 @@ function Write-Log {
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+$script:PortableWinget = $null   # set when Strategy C produces a working copy
+
 function Test-IsAdmin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
         [Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Test-IsSystem {
+    ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value -eq 'S-1-5-18'
 }
 
 function Resolve-WingetPath {
@@ -178,8 +197,16 @@ function Resolve-WingetPath {
     return $hit
 }
 
+function Resolve-WingetTarget {
+    # A working portable copy takes precedence over the packaged install.
+    if ($script:PortableWinget -and (Test-Path -LiteralPath $script:PortableWinget)) {
+        return $script:PortableWinget
+    }
+    return Resolve-WingetPath
+}
+
 function Invoke-WingetProbe {
-    # Run winget with WorkingDirectory = package folder (the SYSTEM fix).
+    # Run winget with WorkingDirectory = its own folder (the SYSTEM fix).
     # Returns the exit code, $TimeoutSentinel on hang, or 2 on failure-to-start.
     param(
         [Parameter(Mandatory)][string]$WingetExe,
@@ -208,8 +235,8 @@ function Invoke-WingetProbe {
 }
 
 function Test-WingetHealthy {
-    # $true only if winget resolves AND `--version` exits 0.
-    $wg = Resolve-WingetPath
+    # $true only if a winget (packaged or portable) resolves AND exits 0.
+    $wg = Resolve-WingetTarget
     if (-not $wg) {
         Write-Log 'winget.exe not found on this machine.' 'WARNING'
         return $false
@@ -218,7 +245,7 @@ function Test-WingetHealthy {
     $code = Invoke-WingetProbe -WingetExe $wg
     if ($code -eq 0) { return $true }
     if ($code -eq $WingetDllNotFound) {
-        Write-Log 'winget exits 0xC0000135 (STATUS_DLL_NOT_FOUND): MSIX dependencies missing/mismatched.' 'WARNING'
+        Write-Log 'winget exits 0xC0000135 (STATUS_DLL_NOT_FOUND): package not usable in this context.' 'WARNING'
     } else {
         Write-Log "winget probe failed with $code." 'WARNING'
     }
@@ -251,14 +278,47 @@ function Invoke-Download {
     return $null
 }
 
+function Get-RepairPackages {
+    # Obtain all three packages (pre-staged copies win over downloads).
+    # Returns @{ Main = <bundle path>; Deps = <appx paths> } or $null.
+    if ($DryRun) {
+        Write-Log '[DRYRUN] Would download/stage VCLibs, UI.Xaml, and the App Installer bundle.' 'WARNING'
+        return $null
+    }
+    if (-not (Test-Path -LiteralPath $RepairDir)) {
+        New-Item -Path $RepairDir -ItemType Directory -Force | Out-Null
+    }
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+
+    $deps = @(); $main = $null
+    foreach ($item in $Downloads) {
+        $target = Join-Path $RepairDir $item.Name
+        $staged = Join-Path $ManualPackageDir $item.Name
+        if (Test-Path -LiteralPath $staged) {
+            Write-Log "Using pre-staged package: $staged"
+            Copy-Item -LiteralPath $staged -Destination $target -Force
+        } elseif (-not (Invoke-Download -Urls $item.Urls -OutFile $target)) {
+            Write-Log "Could not obtain $($item.Name) from any source." 'ERROR'
+            return $null
+        }
+        if ($item.Kind -eq 'main') { $main = $target } else { $deps += $target }
+    }
+    return @{ Main = $main; Deps = $deps }
+}
+
 # ---------------------------------------------------------------------------
 # Strategy 0: per-user registration of the staged App Installer package
 # ---------------------------------------------------------------------------
 function Invoke-PackageRegistration {
-    # Provisioned MSIX packages only register per-user at LOGON; SYSTEM never
-    # logs on, so register the staged App Installer (plus its staged framework
-    # dependencies) for the invoking account directly. Free -- no downloads.
+    # Provisioned MSIX packages only register per-user at LOGON; register the
+    # staged App Installer for the invoking account directly. Free -- no
+    # downloads. NOT possible for LocalSystem: Windows rejects the operation
+    # with 0x80073CF9 ("Local System account is not allowed").
     Write-Log '--- Strategy 0: Add-AppxPackage -Register for the invoking account ---'
+    if (Test-IsSystem) {
+        Write-Log 'Skipped: Windows blocks LocalSystem from Appx Register (0x80073CF9). Strategy C covers SYSTEM.'
+        return $false
+    }
     if ($DryRun) {
         Write-Log '[DRYRUN] Would register the staged App Installer manifest for the current user.' 'WARNING'
         return $false
@@ -323,60 +383,94 @@ function Invoke-ModuleRepair {
 # Strategy B: manual machine-wide provisioning
 # ---------------------------------------------------------------------------
 function Invoke-ManualProvision {
-    Write-Log '--- Strategy B: manual provisioning (DesktopAppInstaller + VCLibs + UI.Xaml) ---'
-    if ($DryRun) {
-        Write-Log '[DRYRUN] Would download 3 packages and run Add-AppxProvisionedPackage -Online.' 'WARNING'
-        return $false
-    }
-
-    if (-not (Test-Path -LiteralPath $RepairDir)) {
-        New-Item -Path $RepairDir -ItemType Directory -Force | Out-Null
-    }
-    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-
-    $dependencyPaths = @()
-    $mainPath = $null
-
-    foreach ($item in $Downloads) {
-        $target = Join-Path $RepairDir $item.Name
-
-        # Pre-staged copy (dark-network path) wins over download.
-        $staged = Join-Path $ManualPackageDir $item.Name
-        if (Test-Path -LiteralPath $staged) {
-            Write-Log "Using pre-staged package: $staged"
-            Copy-Item -LiteralPath $staged -Destination $target -Force
-        } elseif (-not (Invoke-Download -Urls $item.Urls -OutFile $target)) {
-            Write-Log "Could not obtain $($item.Name) from any source." 'ERROR'
-            return $false
-        }
-
-        if ($item.Kind -eq 'main') { $mainPath = $target } else { $dependencyPaths += $target }
-    }
-
+    param([Parameter(Mandatory)][hashtable]$Packages)
+    Write-Log '--- Strategy B: machine-wide provisioning (DesktopAppInstaller + VCLibs + UI.Xaml) ---'
     try {
-        Write-Log "Provisioning machine-wide: $mainPath"
-        Write-Log "Dependencies: $($dependencyPaths -join '; ')"
+        Write-Log "Provisioning machine-wide: $($Packages.Main)"
+        Write-Log "Dependencies: $($Packages.Deps -join '; ')"
         # -SkipLicense is fine for App Installer (store-licensed framework app).
-        Add-AppxProvisionedPackage -Online -PackagePath $mainPath `
-            -DependencyPackagePath $dependencyPaths -SkipLicense -ErrorAction Stop | Out-Null
+        # Note: DISM silently no-ops (fast "success") when a same-or-newer
+        # version is already provisioned -- callers must re-probe.
+        Add-AppxProvisionedPackage -Online -PackagePath $Packages.Main `
+            -DependencyPackagePath $Packages.Deps -SkipLicense -ErrorAction Stop | Out-Null
         Write-Log 'Add-AppxProvisionedPackage succeeded.'
         return $true
     } catch {
-        Write-Log "Provisioning failed: $($_.Exception.Message)" 'ERROR'
-        # Common cause: a same-or-higher broken version already staged. Try
-        # registering the dependencies alone, which is enough to cure
-        # 0xC0000135 when the App Installer binaries themselves are intact.
+        Write-Log "Provisioning failed: $($_.Exception.Message)" 'WARNING'
         try {
             Write-Log 'Fallback: provisioning dependency packages only...' 'WARNING'
-            foreach ($dep in $dependencyPaths) {
+            foreach ($dep in $Packages.Deps) {
                 Add-AppxProvisionedPackage -Online -PackagePath $dep -SkipLicense -ErrorAction Stop | Out-Null
                 Write-Log "Provisioned dependency: $dep"
             }
             return $true
         } catch {
-            Write-Log "Dependency-only provisioning also failed: $($_.Exception.Message)" 'ERROR'
+            Write-Log "Dependency-only provisioning also failed: $($_.Exception.Message)" 'WARNING'
             return $false
         }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Strategy C: portable extraction (SYSTEM-proof; no Appx deployment)
+# ---------------------------------------------------------------------------
+function Invoke-PortableExtract {
+    # The msixbundle is a zip: extract the x64 msix and put the framework
+    # DLLs beside winget.exe. The result is a plain Win32 winget with no
+    # package identity -- immune to 0xC0000135 and the LocalSystem Appx block.
+    param([Parameter(Mandatory)][hashtable]$Packages)
+    Write-Log '--- Strategy C: portable winget extraction ---'
+    $workDir = Join-Path $DestinationFolder 'winget-portable-tmp'
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+        foreach ($d in @($PortableDir, $workDir)) {
+            if (Test-Path -LiteralPath $d) { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+            New-Item -Path $d -ItemType Directory -Force | Out-Null
+        }
+
+        # Pull the x64 application msix out of the bundle.
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($Packages.Main)
+        try {
+            $entry = $zip.Entries | Where-Object { $_.Name -match '(?i)x64.*\.msix$' } | Select-Object -First 1
+            if (-not $entry) {
+                Write-Log 'No x64 msix found inside the App Installer bundle.' 'ERROR'
+                return $false
+            }
+            Write-Log "Extracting from bundle: $($entry.Name)"
+            $msixPath = Join-Path $workDir $entry.Name
+            [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $msixPath, $true)
+        } finally { $zip.Dispose() }
+
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($msixPath, $PortableDir)
+
+        # Framework DLLs (msvcp140_app, vcruntime140_app, Microsoft.UI.Xaml)
+        # go beside the exe so the plain Win32 loader finds them.
+        foreach ($dep in $Packages.Deps) {
+            $depDir = Join-Path $workDir ([IO.Path]::GetFileNameWithoutExtension($dep))
+            [System.IO.Compression.ZipFile]::ExtractToDirectory($dep, $depDir)
+            Get-ChildItem -LiteralPath $depDir -Filter '*.dll' -Recurse -ErrorAction SilentlyContinue |
+                ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $PortableDir -Force }
+        }
+
+        $exe = Join-Path $PortableDir 'winget.exe'
+        if (-not (Test-Path -LiteralPath $exe)) {
+            Write-Log 'winget.exe missing after extraction.' 'ERROR'
+            return $false
+        }
+        Write-Log "Portable winget staged: $exe"
+
+        if ((Invoke-WingetProbe -WingetExe $exe) -eq 0) {
+            $script:PortableWinget = $exe
+            Write-Log "Portable winget operational: $exe"
+            return $true
+        }
+        Write-Log 'Portable winget still failing its probe.' 'ERROR'
+        return $false
+    } catch {
+        Write-Log "Portable extraction failed: $($_.Exception.Message)" 'ERROR'
+        return $false
+    } finally {
+        Remove-Item -LiteralPath $workDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -393,7 +487,7 @@ $exit = 0
 try {
     Write-Log ('=' * 70)
     Write-Log "Winget repair / machine enablement  (script v$ScriptVersion)"
-    Write-Log "Computer: $env:COMPUTERNAME   User: $(whoami)   IsAdmin: $(Test-IsAdmin)"
+    Write-Log "Computer: $env:COMPUTERNAME   User: $(whoami)   IsAdmin: $(Test-IsAdmin)   IsSystem: $(Test-IsSystem)"
     Write-Log "Force: $($Force.IsPresent)   SkipModuleRepair: $($SkipModuleRepair.IsPresent)   DryRun: $($DryRun.IsPresent)"
 
     if (-not (Test-IsAdmin)) {
@@ -419,9 +513,9 @@ try {
     if ($healthy) { Write-Log 'winget healthy but -Force specified; repairing anyway.' 'WARNING' }
 
     # --- Repair ---
-    # Strategy 0 first: registration is free and is the common cure when the
-    # packages are already staged (SYSTEM has no logon to register them at).
     $repaired = $false
+
+    # Strategy 0: free when it applies (skipped under SYSTEM).
     if (Invoke-PackageRegistration) {
         if (Test-WingetHealthy) {
             Write-Log 'Per-user registration alone fixed winget; no downloads needed.'
@@ -430,16 +524,30 @@ try {
             Write-Log 'Registration succeeded but winget still failing; escalating.' 'WARNING'
         }
     }
+
+    # Strategy A: supported repair path (module uses the deployment API).
     if (-not $repaired -and -not $SkipModuleRepair) {
-        $repaired = Invoke-ModuleRepair
+        if (Invoke-ModuleRepair) {
+            $repaired = Test-WingetHealthy
+            if (-not $repaired) { Write-Log 'winget still unhealthy after Strategy A.' 'WARNING' }
+        }
     } elseif (-not $repaired) {
         Write-Log 'Strategy A skipped (-SkipModuleRepair).'
     }
+
+    # Strategies B and C share the downloaded packages.
     if (-not $repaired) {
-        $repaired = Invoke-ManualProvision
-        if ($repaired) {
-            # Provisioning registers per-user only at next logon; do it now.
-            Invoke-PackageRegistration | Out-Null
+        $packages = Get-RepairPackages
+        if ($packages) {
+            if (Invoke-ManualProvision -Packages $packages) {
+                Invoke-PackageRegistration | Out-Null   # no-op under SYSTEM
+                Start-Sleep -Seconds 5
+                $repaired = Test-WingetHealthy
+                if (-not $repaired) { Write-Log 'winget still unhealthy after Strategy B; extracting portable copy.' 'WARNING' }
+            }
+            if (-not $repaired) {
+                $repaired = Invoke-PortableExtract -Packages $packages
+            }
         }
     }
 
@@ -454,10 +562,9 @@ try {
 
     # --- Verify ---
     Write-Log '--- Post-repair verification ---'
-    Start-Sleep -Seconds 5
-    $wg = Resolve-WingetPath   # repaired install lands in a NEW version folder
+    $wg = Resolve-WingetTarget
     if (-not $wg) {
-        Write-Log 'winget.exe still not found after repair.' 'ERROR'
+        Write-Log 'winget.exe not found after repair.' 'ERROR'
         $exit = 2; exit $exit
     }
     $code = Invoke-WingetProbe -WingetExe $wg
@@ -466,6 +573,10 @@ try {
         $exit = 2; exit $exit
     }
     Write-Log "winget operational: $wg"
+    if ($script:PortableWinget) {
+        Write-Log "NOTE: working winget is the PORTABLE copy at $($script:PortableWinget); the packaged install remains unusable in this context. Interactive users get the packaged winget at next logon if provisioning succeeded." 'WARNING'
+        $exit = 1
+    }
 
     # Prime sources so the first real install under SYSTEM doesn't stall on
     # source bootstrap. Non-fatal if it fails (offline, proxy).
