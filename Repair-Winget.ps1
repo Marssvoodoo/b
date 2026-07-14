@@ -19,23 +19,29 @@
          package folder) and run `winget --version` with the working
          directory set to the package folder (the SYSTEM working-dir fix).
          Healthy + not -Force -> exit 0, nothing touched.
-      3. Strategy A -- Microsoft.WinGet.Client PowerShell module:
+      3. Strategy 0 -- per-user registration (free, no downloads):
+         Add-AppxPackage -Register on the staged App Installer's
+         AppxManifest.xml. Provisioned MSIX packages only register per-user
+         at LOGON, and SYSTEM never logs on -- so on many broken boxes every
+         package is already on disk and registration for the invoking
+         account is the only missing piece. This is the most common cure.
+      4. Strategy A -- Microsoft.WinGet.Client PowerShell module:
          install NuGet provider + module from PSGallery (AllUsers), then
          Repair-WinGetPackageManager -AllUsers -Force -Latest. This is
          Microsoft's supported repair path and handles dependency matching
          itself. Needs PSGallery reachability.
-      4. Strategy B -- manual machine-wide provisioning (no PSGallery):
+      5. Strategy B -- manual machine-wide provisioning (no PSGallery):
          download Microsoft.VCLibs.x64.14.00.Desktop.appx,
          Microsoft.UI.Xaml.2.8 (x64) and the latest
          Microsoft.DesktopAppInstaller msixbundle (aka.ms/getwinget), then
-         Add-AppxProvisionedPackage -Online with the dependencies. Staged
-         packages give the WindowsApps folder a matched dependency set, which
-         is exactly what 0xC0000135 is missing. Provisioning also registers
-         the package for each user at next logon.
-      5. Re-probe: re-resolve winget.exe (the repaired install lands in a NEW
-         versioned folder), run `winget --version`, then prime sources with
-         `winget source update` so the first real install doesn't stall on
-         source bootstrap under SYSTEM.
+         Add-AppxProvisionedPackage -Online with the dependencies, followed
+         by per-user registration (provisioning alone only registers at next
+         logon; DISM also no-ops silently when a same-or-newer App Installer
+         is already provisioned).
+      6. Re-probe: re-resolve winget.exe (the repaired install can land in a
+         NEW versioned folder), run `winget --version`, then prime sources
+         with `winget source update` so the first real install doesn't stall
+         on source bootstrap under SYSTEM.
 
     Pair with Reinstall-CitrixLTSR.ps1: run this first (or let that script's
     built-in repair fire), and winget-tier sourcing works fleet-wide.
@@ -61,8 +67,14 @@
 
 .NOTES
     Author  : MEB -- Oak Street Health / CVS Health IT Operations
-    Version : 1.0.0
+    Version : 1.1.0
     Date    : 2026-07-14
+    v1.1.0  : Added Strategy 0 (Add-AppxPackage -Register for the invoking
+              account, tried before any download) and post-provisioning
+              registration in Strategy B. Field finding from OSHCGHL0X54:
+              DISM no-ops when a same-or-newer App Installer is already
+              provisioned, and per-user registration was the actual gap.
+    v1.0.0  : Initial release.
     Context : NT AUTHORITY\SYSTEM (WS1 Device context) or elevated admin
     PowerShell 5.1 compatible. Logs to C:\drop\citrix.
     Downloads require outbound HTTPS to aka.ms / *.microsoft.com / github.com
@@ -78,7 +90,7 @@ param(
     [switch]$DryRun
 )
 
-$ScriptVersion     = '1.0.0'
+$ScriptVersion     = '1.1.0'
 $DestinationFolder = 'C:\drop\citrix'
 $RepairDir         = Join-Path $DestinationFolder 'winget-repair'
 $LogRetainDays     = 30
@@ -240,6 +252,39 @@ function Invoke-Download {
 }
 
 # ---------------------------------------------------------------------------
+# Strategy 0: per-user registration of the staged App Installer package
+# ---------------------------------------------------------------------------
+function Invoke-PackageRegistration {
+    # Provisioned MSIX packages only register per-user at LOGON; SYSTEM never
+    # logs on, so register the staged App Installer (plus its staged framework
+    # dependencies) for the invoking account directly. Free -- no downloads.
+    Write-Log '--- Strategy 0: Add-AppxPackage -Register for the invoking account ---'
+    if ($DryRun) {
+        Write-Log '[DRYRUN] Would register the staged App Installer manifest for the current user.' 'WARNING'
+        return $false
+    }
+    $wg = Resolve-WingetPath
+    if (-not $wg) {
+        Write-Log 'No staged App Installer found to register.' 'WARNING'
+        return $false
+    }
+    $manifest = Join-Path (Split-Path -Path $wg -Parent) 'AppxManifest.xml'
+    if (-not (Test-Path -LiteralPath $manifest)) {
+        Write-Log "AppxManifest.xml not found beside winget.exe: $manifest" 'WARNING'
+        return $false
+    }
+    try {
+        Write-Log "Registering: $manifest"
+        Add-AppxPackage -Register $manifest -DisableDevelopmentMode -ForceApplicationShutdown -ErrorAction Stop
+        Write-Log 'App Installer registered for current user.'
+        return $true
+    } catch {
+        Write-Log "Add-AppxPackage -Register failed: $($_.Exception.Message)" 'WARNING'
+        return $false
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Strategy A: Microsoft.WinGet.Client module repair
 # ---------------------------------------------------------------------------
 function Invoke-ModuleRepair {
@@ -374,14 +419,28 @@ try {
     if ($healthy) { Write-Log 'winget healthy but -Force specified; repairing anyway.' 'WARNING' }
 
     # --- Repair ---
+    # Strategy 0 first: registration is free and is the common cure when the
+    # packages are already staged (SYSTEM has no logon to register them at).
     $repaired = $false
-    if (-not $SkipModuleRepair) {
+    if (Invoke-PackageRegistration) {
+        if (Test-WingetHealthy) {
+            Write-Log 'Per-user registration alone fixed winget; no downloads needed.'
+            $repaired = $true
+        } else {
+            Write-Log 'Registration succeeded but winget still failing; escalating.' 'WARNING'
+        }
+    }
+    if (-not $repaired -and -not $SkipModuleRepair) {
         $repaired = Invoke-ModuleRepair
-    } else {
+    } elseif (-not $repaired) {
         Write-Log 'Strategy A skipped (-SkipModuleRepair).'
     }
     if (-not $repaired) {
         $repaired = Invoke-ManualProvision
+        if ($repaired) {
+            # Provisioning registers per-user only at next logon; do it now.
+            Invoke-PackageRegistration | Out-Null
+        }
     }
 
     if ($DryRun) {

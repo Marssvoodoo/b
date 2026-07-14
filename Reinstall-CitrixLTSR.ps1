@@ -23,6 +23,9 @@
          winget runtime itself -- via Repair-Winget.ps1 if packaged alongside,
          else by provisioning DesktopAppInstaller + VCLibs + UI.Xaml machine-
          wide -- then retries the winget tier once. Disable with -NoWingetRepair.
+         v1.2.1: repair now starts with per-user registration of the staged
+         App Installer package (Add-AppxPackage -Register), since provisioned
+         MSIX packages only register at logon and SYSTEM never logs on.
       3. Optional SHA-256 verification (-ExpectedSha256).
       4. Kill running Citrix processes (they block silent reinstall).
       5. Run: CitrixWorkspaceApp.exe /silent /forceinstall /noreboot
@@ -66,8 +69,14 @@
 
 .NOTES
     Author  : MEB -- Oak Street Health / CVS Health IT Operations
-    Version : 1.2.0
+    Version : 1.2.1
     Date    : 2026-07-14
+    v1.2.1  : Fix winget repair on boxes where App Installer is already
+              provisioned (DISM no-ops): provisioned MSIX packages only
+              register per-user at logon and SYSTEM never logs on, so now
+              Add-AppxPackage -Register the App Installer manifest for the
+              invoking account -- tried FIRST (no downloads), and again after
+              provisioning.
     v1.2.0  : Self-heal winget: on 0xC0000135, repair the winget runtime
               (Repair-Winget.ps1 sidecar, else inline machine-wide provisioning
               of DesktopAppInstaller + VCLibs + UI.Xaml) and retry tier 4/5
@@ -93,7 +102,7 @@ param(
     [switch]$DryRun
 )
 
-$ScriptVersion    = '1.2.0'
+$ScriptVersion    = '1.2.1'
 $DestinationFolder = 'C:\drop\citrix'
 $LogRetainDays    = 30
 $TimeoutSentinel  = 99001
@@ -302,6 +311,38 @@ function Invoke-WingetProcess {
 # ---------------------------------------------------------------------------
 $script:WingetRepairAttempted = $false
 
+function Test-WingetOperational {
+    # Re-resolve (repairs can land in a new version folder) and probe.
+    $wg = Resolve-WingetPath
+    if (-not $wg) { return $false }
+    $script:WingetDir = Split-Path -Path $wg -Parent
+    return ((Invoke-WingetProcess -WingetExe $wg -Arguments '--version' -TimeoutSecondsLocal 120) -eq 0)
+}
+
+function Register-WingetForCurrentUser {
+    # v1.2.1: provisioned MSIX packages only register per-user at LOGON, and
+    # SYSTEM never logs on -- so on many 0xC0000135 boxes every package is
+    # already on disk and per-user registration is the only missing piece.
+    # Registering the App Installer manifest for the invoking account also
+    # pulls in its staged framework dependencies (VCLibs/UI.Xaml).
+    $wg = Resolve-WingetPath
+    if (-not $wg) { return $false }
+    $manifest = Join-Path (Split-Path -Path $wg -Parent) 'AppxManifest.xml'
+    if (-not (Test-Path -LiteralPath $manifest)) {
+        Write-Log "AppxManifest.xml not found beside winget.exe: $manifest" 'WARNING'
+        return $false
+    }
+    try {
+        Write-Log "Registering App Installer for current user: $manifest"
+        Add-AppxPackage -Register $manifest -DisableDevelopmentMode -ForceApplicationShutdown -ErrorAction Stop
+        Write-Log 'App Installer registered for current user.'
+        return $true
+    } catch {
+        Write-Log "Add-AppxPackage -Register failed: $($_.Exception.Message)" 'WARNING'
+        return $false
+    }
+}
+
 function Repair-WingetRuntime {
     # Makes the machine winget-capable when winget dies with 0xC0000135
     # (missing/mismatched MSIX dependencies: VCLibs / UI.Xaml). Returns $true
@@ -334,8 +375,20 @@ function Repair-WingetRuntime {
         }
     }
 
-    # Inline fallback: machine-wide provisioning of App Installer + matched
-    # dependencies. This is exactly what 0xC0000135 is missing.
+    # Inline step 1 (free, no downloads): per-user registration of the
+    # already-staged App Installer. On boxes where a current App Installer is
+    # already provisioned machine-wide (DISM would no-op), this alone cures
+    # 0xC0000135 under SYSTEM.
+    if (Register-WingetForCurrentUser) {
+        if (Test-WingetOperational) {
+            Write-Log 'winget operational after per-user registration (no downloads needed).'
+            return $true
+        }
+        Write-Log 'Registration succeeded but winget still failing; provisioning packages.' 'WARNING'
+    }
+
+    # Inline step 2: machine-wide provisioning of App Installer + matched
+    # dependencies, for boxes where the packages genuinely are not staged.
     Write-Log 'Repairing winget inline: provisioning DesktopAppInstaller + dependencies machine-wide.'
     $repairDir = Join-Path $DestinationFolder 'winget-repair'
     if (-not (Test-Path -LiteralPath $repairDir)) {
@@ -393,13 +446,15 @@ function Repair-WingetRuntime {
         }
     }
 
+    # Provisioning alone registers per-user only at next logon; register now
+    # for the invoking (SYSTEM) account, then probe.
     Start-Sleep -Seconds 5
-    $wg = Resolve-WingetPath   # repaired install lands in a new version folder
-    if (-not $wg) { Write-Log 'winget.exe still not found after repair.' 'ERROR'; return $false }
-    $script:WingetDir = Split-Path -Path $wg -Parent
-    $probe = Invoke-WingetProcess -WingetExe $wg -Arguments '--version' -TimeoutSecondsLocal 120
-    if ($probe -eq 0) { Write-Log "winget operational after repair: $wg"; return $true }
-    Write-Log "winget still failing after repair (exit $probe)." 'ERROR'
+    Register-WingetForCurrentUser | Out-Null
+    if (Test-WingetOperational) {
+        Write-Log "winget operational after repair: $($script:WingetDir)"
+        return $true
+    }
+    Write-Log 'winget still failing after provisioning + registration.' 'ERROR'
     return $false
 }
 
