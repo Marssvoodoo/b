@@ -60,6 +60,20 @@
 .PARAMETER CleanInstall
     Use /CleanInstall instead of /forceinstall. WARNING: wipes stores/accounts.
 
+.PARAMETER AutoUpdate
+    Controls Citrix Workspace Updater policy, applied both as installer switches
+    and as HKLM registry values (so it also remediates already-installed boxes).
+      disabled (default) - no update checks. Correct for per-machine installs
+                           where users are NOT local admins: any update prompt
+                           they receive fails with "The installer detects that a
+                           client already exists and it can be modified only by
+                           an administrator." WS1 owns the update lifecycle.
+      ltsr               - notify, but LTSR stream only. Users still need admin
+                           rights to apply it (prompt will error for non-admins).
+      current            - notify on Current Release. NOT recommended: this is
+                           what silently pulls machines off the LTSR track.
+      skip               - leave auto-update configuration untouched.
+
 .PARAMETER NoWingetRepair
     Do not attempt to repair a broken winget runtime (0xC0000135); just fall
     through to the staging-reminder failure path as v1.1.0 did.
@@ -72,8 +86,16 @@
 
 .NOTES
     Author  : MEB -- Oak Street Health / CVS Health IT Operations
-    Version : 1.2.2
-    Date    : 2026-07-14
+    Version : 1.3.0
+    Date    : 2026-07-30
+    v1.3.0  : Added -AutoUpdate (default 'disabled'). The built-in Citrix
+              Workspace Updater defaults to the Current Release stream, so an
+              LTSR machine gets offered CR; on a per-machine install a non-admin
+              user then hits "client already exists ... only by an
+              administrator". Now sets /AutoUpdateCheck (+/AutoUpdateStream) at
+              install AND writes the HKLM AutoUpdate values afterward, which
+              remediates machines already deployed. Also verifies and logs the
+              effective policy.
     v1.2.2  : Field fix #2 from OSHCGHL0X54: Windows hard-blocks LocalSystem
               from Appx Register (0x80073CF9), so registration is now skipped
               under SYSTEM, and a new final fallback extracts the downloaded
@@ -107,11 +129,13 @@ param(
     [switch]$SkipWinget,
     [switch]$NoWingetRepair,
     [switch]$CleanInstall,
+    [ValidateSet('disabled', 'ltsr', 'current', 'skip')]
+    [string]$AutoUpdate = 'disabled',
     [int]$TimeoutSeconds = 900,
     [switch]$DryRun
 )
 
-$ScriptVersion    = '1.2.2'
+$ScriptVersion    = '1.3.0'
 $DestinationFolder = 'C:\drop\citrix'
 $LogRetainDays    = 30
 $TimeoutSentinel  = 99001
@@ -243,6 +267,82 @@ function Invoke-Process {
     }
     Write-Log "Exit code: $code"
     return $code
+}
+
+# ---------------------------------------------------------------------------
+# v1.3.0: Citrix Workspace Updater policy
+# ---------------------------------------------------------------------------
+# Registry home of the updater settings (REG_SZ values), per Citrix docs:
+#   64-bit: HKLM\SOFTWARE\WOW6432Node\Citrix\ICA Client\AutoUpdate
+#   32-bit: HKLM\SOFTWARE\Citrix\ICA Client\AutoUpdate
+# Both are written; the one that does not apply to this OS is harmless.
+$AutoUpdateKeys = @(
+    'HKLM:\SOFTWARE\WOW6432Node\Citrix\ICA Client\AutoUpdate',
+    'HKLM:\SOFTWARE\Citrix\ICA Client\AutoUpdate'
+)
+
+function Get-AutoUpdateInstallerArgs {
+    # Installer switches matching -AutoUpdate. /AutoUpdateCheck is mandatory
+    # before any other AutoUpdate switch is accepted.
+    switch ($AutoUpdate) {
+        'disabled' { return '/AutoUpdateCheck=disabled' }
+        'ltsr'     { return '/AutoUpdateCheck=auto /AutoUpdateStream=LTSR' }
+        'current'  { return '/AutoUpdateCheck=auto /AutoUpdateStream=Current' }
+        default    { return '' }   # 'skip'
+    }
+}
+
+function Set-CitrixAutoUpdatePolicy {
+    # Enforce the policy in the registry as well as via installer switches.
+    # This is what remediates machines that are ALREADY installed -- no
+    # reinstall required for the popup to stop.
+    if ($AutoUpdate -eq 'skip') {
+        Write-Log 'Auto-update policy left untouched (-AutoUpdate skip).'
+        return
+    }
+    $values = @{}
+    switch ($AutoUpdate) {
+        'disabled' {
+            # Stream is still pinned to LTSR so that if anything re-enables
+            # checking later, the machine cannot drift onto Current Release.
+            $values = [ordered]@{ AutoUpdateCheck = 'Disabled'; AutoUpdateStream = 'LTSR' }
+        }
+        'ltsr'    { $values = [ordered]@{ AutoUpdateCheck = 'Auto'; AutoUpdateStream = 'LTSR' } }
+        'current' { $values = [ordered]@{ AutoUpdateCheck = 'Auto'; AutoUpdateStream = 'Current' } }
+    }
+
+    foreach ($key in $AutoUpdateKeys) {
+        try {
+            if ($DryRun) {
+                Write-Log "[DRYRUN] Would set $key -> $(($values.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ', ')" 'WARNING'
+                continue
+            }
+            if (-not (Test-Path -LiteralPath $key)) {
+                New-Item -Path $key -Force -ErrorAction Stop | Out-Null
+            }
+            foreach ($entry in $values.GetEnumerator()) {
+                New-ItemProperty -Path $key -Name $entry.Key -Value $entry.Value `
+                    -PropertyType String -Force -ErrorAction Stop | Out-Null
+            }
+            Write-Log "Auto-update policy set: $key -> $(($values.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ', ')"
+        } catch {
+            Write-Log "Could not write auto-update policy to ${key}: $($_.Exception.Message)" 'WARNING'
+        }
+    }
+}
+
+function Test-CitrixAutoUpdatePolicy {
+    # Read back what the updater will actually honour, for the log.
+    foreach ($key in $AutoUpdateKeys) {
+        $props = Get-ItemProperty -LiteralPath $key -ErrorAction SilentlyContinue
+        if ($props -and $props.AutoUpdateCheck) {
+            Write-Log ("Effective auto-update policy: AutoUpdateCheck={0}, AutoUpdateStream={1}  ({2})" -f `
+                $props.AutoUpdateCheck, $props.AutoUpdateStream, $key)
+            return $props.AutoUpdateCheck
+        }
+    }
+    Write-Log 'No AutoUpdate policy found in registry; Citrix Workspace Updater will use its defaults (Current Release stream).' 'WARNING'
+    return $null
 }
 
 function Stop-CitrixProcesses {
@@ -744,6 +844,7 @@ try {
     Write-Log "Citrix Workspace LTSR forced reinstall  (script v$ScriptVersion)"
     Write-Log "Computer: $env:COMPUTERNAME   User: $(whoami)   IsAdmin: $(Test-IsAdmin)"
     Write-Log "Mode: $(if ($CleanInstall) { '/CleanInstall (wipes stores!)' } else { '/forceinstall' })   DryRun: $($DryRun.IsPresent)"
+    Write-Log "AutoUpdate policy: $AutoUpdate"
 
     if (-not (Test-IsAdmin)) {
         Write-Log 'Not running elevated. Install requires admin/SYSTEM.' 'ERROR'
@@ -800,6 +901,8 @@ try {
         # Build args and install
         $switch = if ($CleanInstall) { '/CleanInstall' } else { '/forceinstall' }
         $cwaArgs = "/silent $switch /noreboot"
+        $auArgs = Get-AutoUpdateInstallerArgs
+        if ($auArgs) { $cwaArgs = "$cwaArgs $auArgs" }
 
         if ($DryRun) {
             Write-Log "[DRYRUN] Would run: `"$installer`" $cwaArgs"
@@ -848,6 +951,12 @@ try {
                 Write-Log ".ica association still looks wrong (ProgID: '$icaDefault', handler: '$handler'). Machine may need the association repair script." 'WARNING'
                 $exit = [math]::Max($exit,1)
             }
+
+            # v1.3.0: pin the updater policy. Installer switches only apply to
+            # the install we just ran, so write the registry too -- that is what
+            # fixes machines deployed by earlier script versions.
+            Set-CitrixAutoUpdatePolicy
+            Test-CitrixAutoUpdatePolicy | Out-Null
         } else {
             Write-Log 'Citrix Workspace NOT detected after reinstall attempt.' 'ERROR'
             $exit = 2
