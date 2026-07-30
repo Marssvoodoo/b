@@ -33,6 +33,11 @@
       4. Kill running Citrix processes (they block silent reinstall).
       5. Run: CitrixWorkspaceApp.exe /silent /forceinstall /noreboot
          (/forceinstall = reinstall over same/any version; replaces legacy /rcu)
+         CAVEAT (observed 2026-07-30): when the SAME version is already
+         installed, the installer exits 40032 "already up to date" WITHOUT
+         reinstalling -- /forceinstall does not override that check. To
+         genuinely rewrite associations on a same-version client, -CleanInstall
+         is required.
          With -CleanInstall: uses /CleanInstall instead -- scrubs leftover traces
          first but WIPES configured stores/accounts; users must re-add or GPO/WS1
          must re-push store config. Use only if /forceinstall does not cure it.
@@ -42,7 +47,8 @@
     Exit codes (WS1):
       0 = success (verified installed after forced reinstall)
       1 = completed with warnings
-      2 = fatal (no installer, install failed, CWA absent after attempt)
+      2 = fatal (no installer, install failed, CWA absent after attempt, or
+          the installer no-opped with 40032 while the client is still broken)
       3 = installer hung / timeout exceeded
 
 .PARAMETER InstallerPath
@@ -86,8 +92,16 @@
 
 .NOTES
     Author  : MEB -- Oak Street Health / CVS Health IT Operations
-    Version : 1.3.0
+    Version : 1.3.1
     Date    : 2026-07-30
+    v1.3.1  : Map the documented CWA installer exit codes (Citrix CTX695019)
+              instead of lumping them into "unknown". Notably 40032 = "already
+              up to date": the installer SKIPS the reinstall on a version
+              match and /forceinstall does not override it. That is success
+              when the client is healthy (now exit 0 instead of a spurious
+              exit 1), but a hard failure when the client is broken -- the
+              repair silently never ran, so that case now exits 2 and points
+              at -CleanInstall.
     v1.3.0  : Added -AutoUpdate (default 'disabled'). The built-in Citrix
               Workspace Updater defaults to the Current Release stream, so an
               LTSR machine gets offered CR; on a per-machine install a non-admin
@@ -135,7 +149,7 @@ param(
     [switch]$DryRun
 )
 
-$ScriptVersion    = '1.3.0'
+$ScriptVersion    = '1.3.1'
 $DestinationFolder = 'C:\drop\citrix'
 $LogRetainDays    = 30
 $TimeoutSentinel  = 99001
@@ -858,6 +872,7 @@ try {
     # Locate installer
     $installer = Resolve-Installer
     $usedWingetDirect = $false
+    $installerSkipped = $false   # set when the installer no-ops with 40032
     if (-not $installer) {
         # v1.1.0 last resort: direct winget forced reinstall (v1.2.0: now
         # self-heals a 0xC0000135 winget before giving up; appends
@@ -916,13 +931,28 @@ try {
             Write-Log 'CWA installer timed out and was terminated.' 'ERROR'
             $exit = 3; exit $exit
         }
-        # CWA installer: 0 = ok, 3010 = ok reboot required, 1603 = fatal msi error
+        # CWA installer exit codes (Citrix CTX695019).
         switch ($code) {
             0     { Write-Log 'CWA installer reported success (exit 0).' }
             3010  { Write-Log 'CWA installer success; reboot required to finalize (3010).' 'WARNING'; $exit = [math]::Max($exit,1) }
+            40032 {
+                # "Your Citrix app is already up to date." The installer
+                # short-circuits on a version match and does NOT reinstall --
+                # /forceinstall does not override this. Benign when the goal
+                # was to get current; NOT benign when the goal was to repair a
+                # same-version broken client (see the .ica check below).
+                Write-Log 'CWA installer returned 40032: already up to date -- installer exited without reinstalling.'
+                $installerSkipped = $true
+            }
+            40037 { Write-Log 'CWA installed with mandatory components only (40037); some optional components did not install.' 'WARNING'; $exit = [math]::Max($exit,1) }
+            40008 { Write-Log 'CWA installer reports a more recent version is available (40008).' 'WARNING'; $exit = [math]::Max($exit,1) }
+            40001 { Write-Log 'CWA already installed by an administrator (40001); this context cannot modify it.' 'ERROR'; $exit = 2 }
+            40002 { Write-Log 'A previous CWA installation exists and must be removed first (40002). Consider -CleanInstall or the remnants cleanup script.' 'ERROR'; $exit = 2 }
+            40026 { Write-Log 'CWA installer could not stop processes/drivers (40026). Reboot and re-run.' 'ERROR'; $exit = 2 }
+            40034 { Write-Log 'CWA installer hit a Windows Installer failure (40034). Check %TEMP%\CTXWorkspaceInstallLogs.' 'ERROR'; $exit = 2 }
             1603  { Write-Log 'CWA installer fatal error 1603. Check %TEMP%\CTXWorkspaceInstallLogs / C:\Program Files (x86)\Citrix\Logs.' 'ERROR'; $exit = 2 }
             default {
-                Write-Log "CWA installer returned $code; verifying anyway." 'WARNING'
+                Write-Log "CWA installer returned $code; verifying anyway. (Code list: Citrix CTX695019.)" 'WARNING'
                 $exit = [math]::Max($exit,1)
             }
         }
@@ -947,9 +977,22 @@ try {
             }
             if ($handler -and $handler -match 'wfcrun32|CDViewer') {
                 Write-Log ".ica association verified: $icaDefault -> $handler"
+                if ($installerSkipped) {
+                    Write-Log 'Client was already current and healthy; no reinstall was needed.'
+                }
             } else {
-                Write-Log ".ica association still looks wrong (ProgID: '$icaDefault', handler: '$handler'). Machine may need the association repair script." 'WARNING'
-                $exit = [math]::Max($exit,1)
+                Write-Log ".ica association still looks wrong (ProgID: '$icaDefault', handler: '$handler')." 'WARNING'
+                if ($installerSkipped) {
+                    # The repair the script exists to perform did not actually
+                    # happen: the installer refused to re-run over the same
+                    # version, so nothing was rewritten.
+                    Write-Log 'REPAIR DID NOT RUN: installer exited 40032 (already up to date) without reinstalling, so file associations were never rewritten.' 'ERROR'
+                    Write-Log 'Re-run with -CleanInstall to force a genuine reinstall. WARNING: -CleanInstall wipes configured stores/accounts; GPO/WS1 must re-push store config.' 'ERROR'
+                    $exit = 2
+                } else {
+                    Write-Log 'Machine may need the association repair script.' 'WARNING'
+                    $exit = [math]::Max($exit,1)
+                }
             }
 
             # v1.3.0: pin the updater policy. Installer switches only apply to
