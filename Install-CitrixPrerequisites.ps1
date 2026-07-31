@@ -70,8 +70,16 @@
 
 .NOTES
     Author  : MEB -- Oak Street Health / CVS Health IT Operations
-    Version : 1.2.0
+    Version : 1.3.0
     Date    : 2026-07-31
+    v1.3.0  : Remediation now ESCALATES and verifies the on-disk DLL after
+              each step instead of trusting the exit code. /install is tried
+              FIRST: the bundle at aka.ms (14.44) is newer than what is
+              usually registered (14.42), so it performs a real upgrade and
+              rewrites the files -- and unlike /repair it does not need the
+              package's cached MSI, which an aggressive cleanup may have
+              deleted (the likely cause of the 1603 seen on HCDL-BP0WCW3).
+              /repair is now the second step, uninstall+install the third.
     v1.2.0  : /repair returned 1603 on HCDL-BP0WCW3 and left the DLL stale.
               Added: bundle+MSI logging on every install/repair with the real
               error surfaced (1603 alone says nothing); -ForceReinstall
@@ -100,7 +108,7 @@ param(
     [switch]$DryRun
 )
 
-$ScriptVersion     = '1.2.0'
+$ScriptVersion     = '1.3.0'
 $DestinationFolder = 'C:\drop\citrix'
 $WorkDir           = Join-Path $DestinationFolder 'prereqs'
 $LogRetainDays     = 30
@@ -252,16 +260,43 @@ function Test-PrereqMet {
     return $false
 }
 
-function Get-PrereqAction {
-    # 'repair'  -- package registered as current but the on-disk DLL is stale,
-    #              so a plain /install no-ops with 1638 and fixes nothing.
-    # 'install' -- package missing or genuinely below minimum.
-    param([Parameter(Mandatory)]$State, [Parameter(Mandatory)][string]$Key)
-    if ($Key -notin @('vcx64','vcx86')) { return 'install' }
-    $reg = if ($Key -eq 'vcx64') { $State.vcx64 }    else { $State.vcx86 }
-    $dll = if ($Key -eq 'vcx64') { $State.vcx64Dll } else { $State.vcx86Dll }
-    if ($reg -and $reg -ge $MinVCRedist -and $dll -and $dll -lt $MinVCRedist) { return 'repair' }
-    return 'install'
+function Invoke-PrereqRemediation {
+    # v1.3.0: escalate, verifying the ON-DISK DLL after each step rather than
+    # trusting the installer's exit code.
+    #   1. /install  -- the bundle at aka.ms is newer than what is typically
+    #                   registered (14.44 vs 14.42), so this is a real UPGRADE
+    #                   and rewrites the files. Cheapest, and unlike /repair it
+    #                   does not depend on the package's cached MSI still being
+    #                   present in C:\Windows\Installer -- which an aggressive
+    #                   cleanup may have removed. Tried FIRST for that reason.
+    #   2. /repair   -- for when the bundle is not newer, so /install no-ops
+    #                   with 1638.
+    #   3. uninstall+install (-ForceReinstall only) -- last resort.
+    # Returns 'ok' | 'reboot' | 'fail'.
+    param([Parameter(Mandatory)][hashtable]$Item)
+    $steps = @('install','repair')
+    if ($ForceReinstall -and $Item.Key -in @('vcx64','vcx86')) { $steps += 'forcereinstall' }
+    $reboot = $false
+
+    foreach ($step in $steps) {
+        if ($step -eq 'forcereinstall') {
+            Write-Log '  Escalating to uninstall + install. Other applications share this runtime and may fail to start until it completes.' 'WARNING'
+            Install-Prereq -Item $Item -Action 'uninstall' | Out-Null
+            $result = Install-Prereq -Item $Item -Action 'install'
+        } else {
+            $result = Install-Prereq -Item $Item -Action $step
+        }
+        if ($result -eq 'reboot') { $reboot = $true }
+
+        # Verify against the file on disk -- exit 0 does not prove the DLL moved.
+        $now = Get-PrereqState
+        if (Test-PrereqMet -State $now -Key $Item.Key) {
+            Write-Log "  $($Item.Name): resolved after /$step (on-disk DLL now meets the minimum)."
+            return $(if ($reboot) { 'reboot' } else { 'ok' })
+        }
+        Write-Log "  /$step completed but the on-disk DLL is still below minimum." 'WARNING'
+    }
+    return 'fail'
 }
 
 function Write-PrereqState {
@@ -494,16 +529,8 @@ try {
     Write-Log '--- Installing ---'
     $rebootNeeded = $false; $failed = @()
     foreach ($item in $needed) {
-        $action = Get-PrereqAction -State $state -Key $item.Key
-        if ($ForceReinstall -and $item.Key -in @('vcx64','vcx86')) {
-            Write-Log "$($item.Name)  [action: uninstall then install (-ForceReinstall)]:" 'WARNING'
-            Write-Log '  Other applications share this runtime and may fail to start until the install completes.' 'WARNING'
-            Install-Prereq -Item $item -Action 'uninstall' | Out-Null
-            $action = 'install'
-        } else {
-            Write-Log "$($item.Name)  [action: $action]:"
-        }
-        switch (Install-Prereq -Item $item -Action $action) {
+        Write-Log "$($item.Name):"
+        switch (Invoke-PrereqRemediation -Item $item) {
             'reboot' { $rebootNeeded = $true }
             'fail'   { $failed += $item.Name }
         }
