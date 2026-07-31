@@ -53,8 +53,16 @@
 
 .NOTES
     Author  : MEB -- Oak Street Health / CVS Health IT Operations
-    Version : 1.0.0
+    Version : 1.1.0
     Date    : 2026-07-31
+    v1.1.0  : FALSE-PASS FIX. v1.0.0 accepted the better of the registry
+              version and the on-disk DLL, so HCDL-BP0WCW3 reported "all
+              prerequisites met" while SysWOW64\msvcp140.dll was still
+              14.22.27821.0 -- the exact module wfcrun32.exe faults in. The
+              on-disk DLL is now authoritative, and when the package is
+              registered as current but its DLL is stale the script runs
+              /repair (a plain /install just returns 1638 and changes
+              nothing).
     Context : NT AUTHORITY\SYSTEM (WS1 Device context) or elevated admin
     PowerShell 5.1 compatible. Logs to C:\drop\citrix.
     Needs outbound HTTPS to aka.ms. Re-run CWA launch test after a reboot if
@@ -67,7 +75,7 @@ param(
     [switch]$DryRun
 )
 
-$ScriptVersion     = '1.0.0'
+$ScriptVersion     = '1.1.0'
 $DestinationFolder = 'C:\drop\citrix'
 $WorkDir           = Join-Path $DestinationFolder 'prereqs'
 $LogRetainDays     = 30
@@ -201,24 +209,49 @@ function Get-PrereqState {
 function Test-PrereqMet {
     param([Parameter(Mandatory)]$State, [Parameter(Mandatory)][string]$Key)
     switch ($Key) {
-        # For VC++ take the better of registry and on-disk DLL: either being
-        # current means the loader has something good to bind to.
-        'vcx64' { $best = @($State.vcx64, $State.vcx64Dll) | Where-Object { $_ } | Sort-Object -Descending | Select-Object -First 1
-                  return ($best -and $best -ge $MinVCRedist) }
-        'vcx86' { $best = @($State.vcx86, $State.vcx86Dll) | Where-Object { $_ } | Sort-Object -Descending | Select-Object -First 1
-                  return ($best -and $best -ge $MinVCRedist) }
+        # v1.1.0: the ON-DISK DLL is authoritative for VC++, NOT the registry.
+        # The loader binds %SystemRoot%\SysWOW64\msvcp140.dll (or System32 for
+        # x64); the redist registry key only records what the package believes
+        # it installed. Those disagree in the field -- HCDL-BP0WCW3 had
+        # registry=14.42.34433.0 with the DLL still at 14.22.27821.0, and that
+        # 14.22 is exactly the module wfcrun32.exe faulted in. Trusting the
+        # registry there produced a false pass. Registry is used only as a
+        # fallback when the DLL cannot be read at all.
+        'vcx64' { $v = if ($State.vcx64Dll) { $State.vcx64Dll } else { $State.vcx64 }
+                  return ($v -and $v -ge $MinVCRedist) }
+        'vcx86' { $v = if ($State.vcx86Dll) { $State.vcx86Dll } else { $State.vcx86 }
+                  return ($v -and $v -ge $MinVCRedist) }
         'netx64' { return ($State.netx64 -and $State.netx64 -ge $MinDotNet) }
         'netx86' { return ($State.netx86 -and $State.netx86 -ge $MinDotNet) }
     }
     return $false
 }
 
+function Get-PrereqAction {
+    # 'repair'  -- package registered as current but the on-disk DLL is stale,
+    #              so a plain /install no-ops with 1638 and fixes nothing.
+    # 'install' -- package missing or genuinely below minimum.
+    param([Parameter(Mandatory)]$State, [Parameter(Mandatory)][string]$Key)
+    if ($Key -notin @('vcx64','vcx86')) { return 'install' }
+    $reg = if ($Key -eq 'vcx64') { $State.vcx64 }    else { $State.vcx86 }
+    $dll = if ($Key -eq 'vcx64') { $State.vcx64Dll } else { $State.vcx86Dll }
+    if ($reg -and $reg -ge $MinVCRedist -and $dll -and $dll -lt $MinVCRedist) { return 'repair' }
+    return 'install'
+}
+
 function Write-PrereqState {
     param([Parameter(Mandatory)]$State)
-    Write-Log ("  VC++ x64 : registry={0,-16} SysWOW/System32 dll={1,-16} min={2}  [{3}]" -f `
-        ($State.vcx64  -as [string]), ($State.vcx64Dll -as [string]), $MinVCRedist, $(if (Test-PrereqMet $State 'vcx64') {'OK'} else {'BELOW MINIMUM'}))
-    Write-Log ("  VC++ x86 : registry={0,-16} SysWOW/System32 dll={1,-16} min={2}  [{3}]" -f `
-        ($State.vcx86  -as [string]), ($State.vcx86Dll -as [string]), $MinVCRedist, $(if (Test-PrereqMet $State 'vcx86') {'OK'} else {'BELOW MINIMUM'}))
+    foreach ($a in @(@{k='vcx64';n='x64';dir='System32'}, @{k='vcx86';n='x86';dir='SysWOW64'})) {
+        $reg = if ($a.k -eq 'vcx64') { $State.vcx64 }    else { $State.vcx86 }
+        $dll = if ($a.k -eq 'vcx64') { $State.vcx64Dll } else { $State.vcx86Dll }
+        $met = Test-PrereqMet $State $a.k
+        Write-Log ("  VC++ {0} : {1}\msvcp140.dll={2,-16} (registry claims {3,-16}) min={4}  [{5}]" -f `
+            $a.n, $a.dir, ($dll -as [string]), ($reg -as [string]), $MinVCRedist, $(if ($met) {'OK'} else {'BELOW MINIMUM'})) `
+            $(if ($met) {'INFO'} else {'WARNING'})
+        if ($reg -and $dll -and $reg -ne $dll) {
+            Write-Log ("    MISMATCH: the registered package version and the DLL actually on disk differ. The loader binds the DLL, so {0} is what CWA gets." -f $dll) 'WARNING'
+        }
+    }
     Write-Log ("  .NET Desktop x64 : {0,-16} min={1}  [{2}]" -f `
         ($State.netx64 -as [string]), $MinDotNet, $(if (Test-PrereqMet $State 'netx64') {'OK'} else {'BELOW MINIMUM'}))
     Write-Log ("  .NET Desktop x86 : {0,-16} min={1}  [{2}]" -f `
@@ -250,21 +283,29 @@ function Invoke-Download {
 function Install-Prereq {
     # Both VC++ redist and the .NET runtime are Burn bundles: same switches.
     # Returns 'ok' | 'reboot' | 'fail'
-    param([Parameter(Mandatory)][hashtable]$Item)
+    param(
+        [Parameter(Mandatory)][hashtable]$Item,
+        [ValidateSet('install','repair')][string]$Action = 'install'
+    )
     $target = Join-Path $WorkDir $Item.File
     if (-not (Invoke-Download -Url $Item.Url -OutFile $target)) { return 'fail' }
+    # /repair rewrites files the package owns. /install would return 1638
+    # ("newer version already installed") and leave the stale DLL in place.
+    $verb = if ($Action -eq 'repair') { '/repair' } else { '/install' }
+    Write-Log "  Running $verb (package is registered as current but its DLL on disk is stale)" `
+        $(if ($Action -eq 'repair') { 'WARNING' } else { 'INFO' })
     try {
-        $p = Start-Process -FilePath $target -ArgumentList '/install','/quiet','/norestart' -PassThru -Wait -ErrorAction Stop
+        $p = Start-Process -FilePath $target -ArgumentList $verb,'/quiet','/norestart' -PassThru -Wait -ErrorAction Stop
         $code = $p.ExitCode
     } catch {
         Write-Log "  Failed to launch installer: $($_.Exception.Message)" 'ERROR'
         return 'fail'
     }
     switch ($code) {
-        0     { Write-Log "  $($Item.Name): installed (exit 0)."; return 'ok' }
-        3010  { Write-Log "  $($Item.Name): installed, reboot required (3010)." 'WARNING'; return 'reboot' }
-        1638  { Write-Log "  $($Item.Name): a newer version is already present (1638)."; return 'ok' }
-        5100  { Write-Log "  $($Item.Name): a newer version is already present (5100)."; return 'ok' }
+        0     { Write-Log "  $($Item.Name): $Action succeeded (exit 0)."; return 'ok' }
+        3010  { Write-Log "  $($Item.Name): $Action succeeded, reboot required (3010)." 'WARNING'; return 'reboot' }
+        1638  { Write-Log "  $($Item.Name): package reports a newer version already present (1638)." 'WARNING'; return 'ok' }
+        5100  { Write-Log "  $($Item.Name): package reports a newer version already present (5100)." 'WARNING'; return 'ok' }
         default { Write-Log "  $($Item.Name): installer returned $code." 'ERROR'; return 'fail' }
     }
 }
@@ -335,8 +376,9 @@ try {
     Write-Log '--- Installing ---'
     $rebootNeeded = $false; $failed = @()
     foreach ($item in $needed) {
-        Write-Log "$($item.Name):"
-        switch (Install-Prereq -Item $item) {
+        $action = Get-PrereqAction -State $state -Key $item.Key
+        Write-Log "$($item.Name)  [action: $action]:"
+        switch (Install-Prereq -Item $item -Action $action) {
             'reboot' { $rebootNeeded = $true }
             'fail'   { $failed += $item.Name }
         }
@@ -351,6 +393,10 @@ try {
 
     if ($still) {
         Write-Log ("STILL below minimum: {0}" -f (($still | ForEach-Object { $_.Name }) -join '; ')) 'ERROR'
+        if ($still | Where-Object { $_.Key -in @('vcx64','vcx86') }) {
+            Write-Log 'A VC++ system DLL is still stale after a repair. Something outside the redistributable is overwriting it (an older app that drops msvcp140.dll into SysWOW64, or a pending-rename that needs a reboot).' 'ERROR'
+            Write-Log 'Next steps: reboot and re-run this script; if it persists, uninstall the VC++ 2015-2022 x86 redistributable from Programs and Features, reboot, then re-run.' 'ERROR'
+        }
         $exit = 2
     } elseif ($rebootNeeded) {
         Write-Log 'All prerequisites met; a reboot is required to finalize. Test the Citrix launch after rebooting.' 'WARNING'
