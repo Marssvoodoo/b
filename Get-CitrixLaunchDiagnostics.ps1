@@ -170,23 +170,57 @@ try {
     if (-not $anyPerUser) { Write-Log '  None found (expected after the user version is uninstalled).' }
 
     # --- 3. Binaries ---
-    Write-Section 'Citrix binaries'
-    $icaDirs = @(
-        (Join-Path ${env:ProgramFiles(x86)} 'Citrix\ICA Client'),
-        (Join-Path $env:ProgramFiles 'Citrix\ICA Client')
+    # Search the whole Citrix tree: components live in sibling folders
+    # (Self Service Plugin, Authentication Manager, ...), not just ICA Client,
+    # so checking a single directory reports false MISSING results.
+    Write-Section 'Citrix binaries (searched across the whole Citrix tree)'
+    $citrixRoots = @(
+        (Join-Path ${env:ProgramFiles(x86)} 'Citrix'),
+        (Join-Path $env:ProgramFiles 'Citrix')
     ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
-    if (-not $icaDirs) { Write-Log '  No Citrix\ICA Client directory found!' 'ERROR' }
-    foreach ($dir in $icaDirs) {
-        Write-Log "  Directory: $dir"
-        foreach ($exe in @('wfcrun32.exe','wfica32.exe','SelfService.exe','SelfServicePlugin.exe','CDViewer.exe','Receiver.exe','concentr.exe','AuthManSvr.exe','WebHelper.exe')) {
-            $full = Join-Path $dir $exe
-            if (Test-Path -LiteralPath $full) {
-                $v = (Get-Item -LiteralPath $full).VersionInfo.FileVersion
-                Write-Log ("    {0,-24} present  v{1}" -f $exe, $v)
-            } else {
-                Write-Log ("    {0,-24} MISSING" -f $exe) 'WARNING'
+    if (-not $citrixRoots) { Write-Log '  No Citrix program directory found!' 'ERROR' }
+    $wanted = @('wfcrun32.exe','wfica32.exe','SelfService.exe','SelfServicePlugin.exe',
+                'CDViewer.exe','Receiver.exe','concentr.exe','AuthManSvr.exe','WebHelper.exe')
+    $allExes = @()
+    foreach ($root in $citrixRoots) {
+        Write-Log "  Root: $root"
+        $allExes += Get-ChildItem -LiteralPath $root -Recurse -File -Filter '*.exe' -ErrorAction SilentlyContinue |
+            Where-Object { $wanted -contains $_.Name }
+    }
+    foreach ($exe in $wanted) {
+        $hits = @($allExes | Where-Object { $_.Name -eq $exe })
+        if ($hits) {
+            foreach ($h in $hits) {
+                Write-Log ("    {0,-24} v{1}  {2}" -f $exe, $h.VersionInfo.FileVersion, $h.DirectoryName)
             }
+        } else {
+            Write-Log ("    {0,-24} NOT FOUND anywhere under the Citrix tree" -f $exe) 'WARNING'
         }
+    }
+
+    # --- 3b. Runtime prerequisites (CWA crashes on launch if these are old) ---
+    Write-Section 'Runtime prerequisites (VC++ / .NET) -- CWA 2507 needs VC++ >=14.42.34433.0, .NET Desktop 8 >=8.0.11'
+    foreach ($a in @(@{n='x64';d='System32';r='HKLM:\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64'},
+                     @{n='x86';d='SysWOW64';r='HKLM:\SOFTWARE\WOW6432Node\Microsoft\VisualStudio\14.0\VC\Runtimes\x86'})) {
+        $reg = (Get-ItemProperty -LiteralPath $a.r -ErrorAction SilentlyContinue).Version
+        $dll = Join-Path (Join-Path $env:SystemRoot $a.d) 'msvcp140.dll'
+        $dllV = if (Test-Path -LiteralPath $dll) { (Get-Item -LiteralPath $dll).VersionInfo.FileVersion } else { 'MISSING' }
+        Write-Log ("  VC++ {0}: registry='{1}'  {2}\msvcp140.dll='{3}'" -f $a.n, $reg, $a.d, $dllV)
+    }
+    foreach ($a in @(@{n='x64';p=(Join-Path $env:ProgramFiles 'dotnet\shared\Microsoft.WindowsDesktop.App')},
+                     @{n='x86';p=(Join-Path ${env:ProgramFiles(x86)} 'dotnet\shared\Microsoft.WindowsDesktop.App')})) {
+        if ($a.p -and (Test-Path -LiteralPath $a.p)) {
+            $vs = (Get-ChildItem -LiteralPath $a.p -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.Name }) -join ', '
+            Write-Log ("  .NET Desktop {0}: {1}" -f $a.n, $vs)
+        } else {
+            Write-Log ("  .NET Desktop {0}: NOT INSTALLED" -f $a.n) 'WARNING'
+        }
+    }
+    # App-local runtime DLLs shadow the system copies in the loader search order.
+    foreach ($root in $citrixRoots) {
+        Get-ChildItem -LiteralPath $root -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { @('msvcp140.dll','vcruntime140.dll','vcruntime140_1.dll','coreclr.dll') -contains $_.Name.ToLower() } |
+            ForEach-Object { Write-Log ("  APP-LOCAL {0}  v{1}  {2}" -f $_.Name, $_.VersionInfo.FileVersion, $_.DirectoryName) 'WARNING' }
     }
 
     # --- 4/5. .ica association, machine then per-user ---
