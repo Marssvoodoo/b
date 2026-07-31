@@ -65,13 +65,33 @@
     this machine. Reversible: delete the two files from the ICA Client folder.
     Affects only Citrix, not other applications.
 
+.PARAMETER RemoveOrphanedRegistration
+    Last resort for MSI System Error 1612. When a product is registered but
+    its cached package under C:\Windows\Installer is gone, Windows Installer
+    can neither remove, repair nor upgrade it -- RemoveExistingProducts fails
+    and takes every install down with it. This clears the stale registration
+    (Uninstall key, Installer\Products, \Features, UserData) and then installs
+    fresh. Every key is exported to .reg under C:\drop\citrix\prereqs\regbackup
+    before deletion, and a key whose backup fails is left alone. This edits the
+    Windows Installer database directly -- use it only once the gentler steps
+    have been tried and the logs show 1612.
+
 .PARAMETER DryRun
     Log what would be downloaded/installed without doing it.
 
 .NOTES
     Author  : MEB -- Oak Street Health / CVS Health IT Operations
-    Version : 1.4.0
+    Version : 1.5.0
     Date    : 2026-07-31
+    v1.5.0  : /layout produced no MSI on HCDL-BP0WCW3, so source-repair could
+              not run either. The layout step now logs what it actually
+              extracted and also looks beside the bundle. Added the real last
+              resort for System Error 1612, -RemoveOrphanedRegistration: the
+              product is registered but its cached package is gone, so
+              RemoveExistingProducts can never succeed; clearing the stale
+              registration (Uninstall key, Installer\Products, \Features and
+              UserData, each exported to .reg first) lets a fresh install
+              proceed with nothing to remove.
     v1.4.0  : The captured MSI log on HCDL-BP0WCW3 showed the real cause:
               "SOURCEMGMT: Failed to resolve source" + Error 1714 / System
               Error 1612 -- the package cached under C:\Windows\Installer is
@@ -113,10 +133,11 @@ param(
     [switch]$CheckOnly,
     [switch]$ForceReinstall,
     [switch]$ShimAppLocal,
+    [switch]$RemoveOrphanedRegistration,
     [switch]$DryRun
 )
 
-$ScriptVersion     = '1.4.0'
+$ScriptVersion     = '1.5.0'
 $DestinationFolder = 'C:\drop\citrix'
 $WorkDir           = Join-Path $DestinationFolder 'prereqs'
 $LogRetainDays     = 30
@@ -268,6 +289,84 @@ function Test-PrereqMet {
     return $false
 }
 
+function Convert-ToPackedGuid {
+    # MSI stores product codes in C:\...\Installer as a "packed" GUID:
+    # {A1B2C3D4-E5F6-7890-ABCD-EF1234567890} -> 4D3C2B1A6F5E0987BADCFE2143658709
+    # (first three groups reversed, remaining bytes pair-swapped).
+    param([Parameter(Mandatory)][string]$Guid)
+    $g = $Guid -replace '[{}\-]', ''
+    if ($g.Length -ne 32) { return $null }
+    $rev = { param($s) ($s.ToCharArray() | ForEach-Object { $_ })[($s.Length-1)..0] -join '' }
+    $swap = { param($s) -join (0..($s.Length/2 - 1) | ForEach-Object { $s.Substring($_*2,2).ToCharArray()[1,0] -join '' }) }
+    return (& $rev $g.Substring(0,8)) + (& $rev $g.Substring(8,4)) + (& $rev $g.Substring(12,4)) +
+           (& $swap $g.Substring(16,4)) + (& $swap $g.Substring(20,12))
+}
+
+function Remove-OrphanedMsiRegistration {
+    # Last resort for System Error 1612: the product is registered but its
+    # cached package is gone, so RemoveExistingProducts can never succeed and
+    # every install/upgrade/repair/uninstall fails. Clearing the stale
+    # registration lets a fresh install proceed with nothing to remove.
+    # Everything deleted is exported to .reg first.
+    param([Parameter(Mandatory)][string]$NamePattern)
+
+    $backupDir = Join-Path $WorkDir 'regbackup'
+    if (-not (Test-Path -LiteralPath $backupDir)) { New-Item -Path $backupDir -ItemType Directory -Force | Out-Null }
+
+    $targets = @()
+    foreach ($root in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+                        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall')) {
+        if (-not (Test-Path $root)) { continue }
+        Get-ChildItem $root -ErrorAction SilentlyContinue | ForEach-Object {
+            $props = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+            if ($props.DisplayName -and $props.DisplayName -like $NamePattern -and $_.PSChildName -match '^\{[0-9A-Fa-f\-]{36}\}$') {
+                $targets += [pscustomobject]@{
+                    Guid = $_.PSChildName; Name = $props.DisplayName; UninstallKey = $_.PSPath
+                }
+            }
+        }
+    }
+    if (-not $targets) {
+        Write-Log "  No installed product matched '$NamePattern'; nothing to clear." 'WARNING'
+        return $false
+    }
+
+    $removedAny = $false
+    foreach ($t in $targets) {
+        Write-Log "  Clearing stale registration: $($t.Name)  $($t.Guid)" 'WARNING'
+        $packed = Convert-ToPackedGuid -Guid $t.Guid
+        if (-not $packed) { Write-Log "    Could not pack GUID $($t.Guid); skipping." 'ERROR'; continue }
+
+        $keys = @(
+            ($t.UninstallKey -replace '^Microsoft\.PowerShell\.Core\\Registry::', 'Registry::'),
+            "Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Classes\Installer\Products\$packed",
+            "Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Classes\Installer\Features\$packed",
+            "Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18\Products\$packed"
+        )
+        foreach ($k in $keys) {
+            if (-not (Test-Path -LiteralPath $k)) { continue }
+            $regPath = ($k -replace '^Registry::', '')
+            $file = Join-Path $backupDir ("{0}_{1}.reg" -f $t.Guid.Trim('{}'), ([IO.Path]::GetFileName($regPath)))
+            if ($DryRun) {
+                Write-Log "    [DRYRUN] Would export and delete $regPath" 'WARNING'
+                continue
+            }
+            & reg.exe export $regPath $file /y 2>&1 | Out-Null
+            if (Test-Path -LiteralPath $file) { Write-Log "    Backed up -> $file" }
+            else { Write-Log "    WARNING: backup of $regPath failed; not deleting it." 'ERROR'; continue }
+            try {
+                Remove-Item -LiteralPath $k -Recurse -Force -ErrorAction Stop
+                Write-Log "    Removed $regPath"
+                $removedAny = $true
+            } catch {
+                Write-Log "    Could not remove ${regPath}: $($_.Exception.Message)" 'ERROR'
+            }
+        }
+    }
+    if ($removedAny) { Write-Log "  Stale registrations cleared. Backups: $backupDir (restore with reg import)." 'WARNING' }
+    return $removedAny
+}
+
 function Repair-FromExtractedSource {
     # For MSI System Error 1612 / "SOURCEMGMT: Failed to resolve source":
     # the package cached under C:\Windows\Installer is gone, so Windows
@@ -290,16 +389,36 @@ function Repair-FromExtractedSource {
 
     Write-Log "  Extracting installer layout to $layout"
     try {
+        # WorkingDirectory matters: under SYSTEM the default cwd is
+        # %SystemRoot%\System32, and a bundle that mis-parses the layout path
+        # will silently drop its payload there instead.
         $p = Start-Process -FilePath $bundle -ArgumentList '/layout',"`"$layout`"",'/quiet','/norestart' `
-             -PassThru -Wait -ErrorAction Stop
-        if ($p.ExitCode -ne 0) { Write-Log "  /layout returned $($p.ExitCode)." 'WARNING' }
+             -WorkingDirectory $layout -PassThru -Wait -ErrorAction Stop
+        Write-Log "  /layout exit code: $($p.ExitCode)"
     } catch {
         Write-Log "  Could not extract layout: $($_.Exception.Message)" 'ERROR'
         return $false
     }
 
-    $msis = Get-ChildItem -LiteralPath $layout -Recurse -Filter '*.msi' -ErrorAction SilentlyContinue
-    if (-not $msis) { Write-Log '  No MSI found in the extracted layout.' 'ERROR'; return $false }
+    # Report what actually landed -- "no MSI found" alone is not diagnosable.
+    $produced = @(Get-ChildItem -LiteralPath $layout -Recurse -ErrorAction SilentlyContinue)
+    Write-Log ("  Layout produced {0} item(s)." -f $produced.Count)
+    foreach ($grp in ($produced | Group-Object Extension | Sort-Object Count -Descending | Select-Object -First 6)) {
+        Write-Log ("    {0,-8} x{1}" -f $(if ($grp.Name) { $grp.Name } else { '<dir>' }), $grp.Count)
+    }
+
+    $msis = @($produced | Where-Object { $_.Extension -ieq '.msi' })
+    if (-not $msis) {
+        # Some bundles write the layout beside themselves rather than into the
+        # requested directory; look there before giving up.
+        $msis = @(Get-ChildItem -LiteralPath $WorkDir -Recurse -Filter '*.msi' -ErrorAction SilentlyContinue)
+        if ($msis) { Write-Log ("  Found {0} MSI(s) elsewhere under {1}." -f $msis.Count, $WorkDir) 'WARNING' }
+    }
+    if (-not $msis) {
+        Write-Log '  No MSI produced by /layout, so the package source still cannot be restored this way.' 'ERROR'
+        Write-Log '  The product registration is orphaned: MSI can neither remove, repair nor upgrade it. Re-run with -RemoveOrphanedRegistration to clear the stale registration (backed up first) and install fresh.' 'ERROR'
+        return $false
+    }
 
     $any = $false
     foreach ($msi in $msis) {
@@ -349,11 +468,20 @@ function Invoke-PrereqRemediation {
     # sourcerepair only applies to the VC++ bundles (the .NET runtime bundle
     # has no /layout-and-recache equivalent worth attempting here).
     if ($Item.Key -in @('vcx64','vcx86')) { $steps += 'sourcerepair' }
+    if ($RemoveOrphanedRegistration -and $Item.Key -in @('vcx64','vcx86')) { $steps += 'deorphan' }
     if ($ForceReinstall -and $Item.Key -in @('vcx64','vcx86')) { $steps += 'forcereinstall' }
     $reboot = $false
 
     foreach ($step in $steps) {
-        if ($step -eq 'sourcerepair') {
+        if ($step -eq 'deorphan') {
+            $arch = if ($Item.Key -eq 'vcx64') { 'X64' } else { 'X86' }
+            Write-Log "  Escalating: clearing the orphaned MSI registration for Microsoft Visual C++ * $arch * Runtime, then installing fresh." 'WARNING'
+            if (Remove-OrphanedMsiRegistration -NamePattern "Microsoft Visual C++ * $arch *Runtime*") {
+                $result = Install-Prereq -Item $Item -Action 'install'
+            } else {
+                $result = 'fail'
+            }
+        } elseif ($step -eq 'sourcerepair') {
             Write-Log '  Escalating: extracting the installer layout and re-caching the MSI from it (fixes System Error 1612 / missing C:\Windows\Installer cache).' 'WARNING'
             $result = if (Repair-FromExtractedSource -Item $Item) { 'ok' } else { 'fail' }
         } elseif ($step -eq 'forcereinstall') {
