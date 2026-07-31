@@ -2,7 +2,7 @@
 .SYNOPSIS
     Test-CitrixHealth.ps1 -- one health check covering every failure mode found
     during the 2026-07 Citrix investigation. Read-only by default; -Fix
-    delegates to the specific repair scripts.
+    repairs what it finds.
 
 .DESCRIPTION
     Each check below exists because it actually broke a machine, and several
@@ -55,10 +55,22 @@
       2 = one or more FAIL results (see the remedy printed for each)
 
 .PARAMETER Fix
-    Attempt remediation by invoking the sibling scripts, in dependency order:
-    prerequisites (incl. orphaned MSI registrations) -> auto-update policy ->
-    .ica association. Each must be present in the same folder as this script.
-    Nothing is repaired that this script did not first report as FAIL.
+    Repair whatever the checks reported as FAIL or WARN. The repairs are built
+    into this script, so it works deployed on its own -- nothing else needs to
+    be present. Order is deliberate: runtime prerequisites first (nothing
+    downstream works while Citrix crashes on launch), then auto-update policy,
+    then the .ica association, and the app-local shim is only removed last and
+    only once the system runtime actually passes.
+
+    Repairs performed natively: runtime install/repair including clearing an
+    orphaned MSI registration (registry exported first), auto-update policy,
+    .ica association plus per-user overrides, stale shim removal.
+
+    The one exception is a full CWA reinstall, which delegates to
+    Reinstall-CitrixLTSR.ps1 if it sits beside this script; if it does not,
+    that single item is reported rather than performed.
+
+    Nothing is changed unless -Fix is passed.
 
 .PARAMETER EventHours
     How far back to look for crash events. Default 24.
@@ -68,8 +80,11 @@
 
 .NOTES
     Author  : MEB -- Oak Street Health / CVS Health IT Operations
-    Version : 1.0.0
+    Version : 1.1.0
     Date    : 2026-07-31
+    v1.1.0  : -Fix repairs natively instead of delegating, so the script is
+              self-contained when deployed alone. Only the full CWA reinstall
+              still needs a sibling script.
     Context : NT AUTHORITY\SYSTEM (WS1 Device context) or elevated admin
     PowerShell 5.1 compatible. Logs to C:\drop\citrix.
     Per-user checks (10, and per-user parts of 7) only see users who are
@@ -83,7 +98,7 @@ param(
     [switch]$Quiet
 )
 
-$ScriptVersion     = '1.0.0'
+$ScriptVersion     = '1.1.0'
 $DestinationFolder = 'C:\drop\citrix'
 $LogRetainDays     = 30
 
@@ -322,7 +337,7 @@ function Test-AppLocalShim {
     if ($sysV -and $sysV -ge $MinVCRedist -and $shimV -and $shimV -lt $sysV) {
         Add-Result 'App-local runtime shim' 'WARN' `
             "shim v$shimV in ICA Client is now OLDER than the system runtime v$sysV, and app-local copies are never serviced" `
-            "delete msvcp140.dll and vcruntime140.dll from $ica, then re-test the launch"
+            "delete msvcp140.dll and vcruntime140.dll from $ica, then re-test the launch" 'shim'
     } else {
         Add-Result 'App-local runtime shim' 'INFO' "present v$shimV (system v$sysV) -- intentional workaround"
     }
@@ -491,37 +506,264 @@ function Test-WingetUnderSystem {
 }
 
 # ---------------------------------------------------------------------------
-# Fix delegation
+# Repairs -- self-contained so this script works deployed on its own.
+# Only the full CWA reinstall delegates, and only if the sibling is present.
 # ---------------------------------------------------------------------------
+function Invoke-Download {
+    param([Parameter(Mandatory)][string]$Url, [Parameter(Mandatory)][string]$OutFile)
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    for ($i = 1; $i -le 3; $i++) {
+        try {
+            Write-Log "    downloading (attempt $i): $Url"
+            Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing -TimeoutSec 600 -ErrorAction Stop
+            if ((Get-Item -LiteralPath $OutFile).Length -lt 100KB) { throw 'file suspiciously small' }
+            return $true
+        } catch {
+            Write-Log "    download failed: $($_.Exception.Message)" 'WARNING'
+            Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue
+            if ($i -lt 3) { Start-Sleep -Seconds ([math]::Pow(2, $i)) }
+        }
+    }
+    return $false
+}
+
+function Convert-ToPackedGuid {
+    # MSI stores product codes packed: {A1B2C3D4-E5F6-7890-ABCD-EF1234567890}
+    # -> 4D3C2B1A6F5E0987BADCFE2143658709
+    param([Parameter(Mandatory)][string]$Guid)
+    $g = $Guid -replace '[{}\-]', ''
+    if ($g.Length -ne 32) { return $null }
+    $rev  = { param($s) ($s.ToCharArray())[($s.Length-1)..0] -join '' }
+    $swap = { param($s) -join (0..($s.Length/2 - 1) | ForEach-Object { $s.Substring($_*2,2).ToCharArray()[1,0] -join '' }) }
+    (& $rev $g.Substring(0,8)) + (& $rev $g.Substring(8,4)) + (& $rev $g.Substring(12,4)) +
+    (& $swap $g.Substring(16,4)) + (& $swap $g.Substring(20,12))
+}
+
+function Remove-OrphanedMsiRegistration {
+    # A product whose cached package is gone cannot be repaired, upgraded or
+    # uninstalled (System Error 1612). Clearing the registration lets a fresh
+    # install proceed with nothing to remove. Everything is exported first.
+    param([Parameter(Mandatory)][string]$NamePattern)
+    $backupDir = Join-Path $DestinationFolder 'health-regbackup'
+    if (-not (Test-Path -LiteralPath $backupDir)) { New-Item -Path $backupDir -ItemType Directory -Force | Out-Null }
+
+    $targets = @()
+    foreach ($root in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+                        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall')) {
+        if (-not (Test-Path $root)) { continue }
+        Get-ChildItem $root -ErrorAction SilentlyContinue | ForEach-Object {
+            $p = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+            if ($p.DisplayName -and $p.DisplayName -like $NamePattern -and $_.PSChildName -match '^\{[0-9A-Fa-f\-]{36}\}$') {
+                $targets += [pscustomobject]@{ Guid = $_.PSChildName; Name = $p.DisplayName; Key = $_.PSPath }
+            }
+        }
+    }
+    if (-not $targets) { Write-Log "    no product matched '$NamePattern'" 'WARNING'; return $false }
+
+    $removed = $false
+    foreach ($t in $targets) {
+        $packed = Convert-ToPackedGuid -Guid $t.Guid
+        if (-not $packed) { continue }
+        Write-Log "    clearing: $($t.Name) $($t.Guid)" 'WARNING'
+        $keys = @(
+            ($t.Key -replace '^Microsoft\.PowerShell\.Core\\Registry::', 'Registry::'),
+            "Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Classes\Installer\Products\$packed",
+            "Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Classes\Installer\Features\$packed",
+            "Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18\Products\$packed"
+        )
+        foreach ($k in $keys) {
+            if (-not (Test-Path -LiteralPath $k)) { continue }
+            $regPath = ($k -replace '^Registry::', '')
+            $file = Join-Path $backupDir ("{0}_{1}.reg" -f $t.Guid.Trim('{}'), [IO.Path]::GetFileName($regPath))
+            & reg.exe export $regPath $file /y 2>&1 | Out-Null
+            if (-not (Test-Path -LiteralPath $file)) { Write-Log "    backup failed for $regPath; not deleting" 'ERROR'; continue }
+            try { Remove-Item -LiteralPath $k -Recurse -Force -ErrorAction Stop; $removed = $true }
+            catch { Write-Log "    could not remove ${regPath}: $($_.Exception.Message)" 'ERROR' }
+        }
+    }
+    if ($removed) { Write-Log "    registrations cleared (backups: $backupDir)" 'WARNING' }
+    return $removed
+}
+
+function Repair-RuntimePrereq {
+    # Install/repair VC++ and .NET; clear an orphaned registration first when
+    # the MSI cache check found one, since nothing else can succeed until then.
+    param([bool]$OrphanFound)
+    $work = Join-Path $DestinationFolder 'health-prereqs'
+    if (-not (Test-Path -LiteralPath $work)) { New-Item -Path $work -ItemType Directory -Force | Out-Null }
+
+    $pkgs = @(
+        @{ Name='VC++ x86'; Url='https://aka.ms/vs/17/release/vc_redist.x86.exe'; File='vc_redist.x86.exe'; Orphan='Microsoft Visual C++ * X86 *Runtime*' }
+        @{ Name='VC++ x64'; Url='https://aka.ms/vs/17/release/vc_redist.x64.exe'; File='vc_redist.x64.exe'; Orphan='Microsoft Visual C++ * X64 *Runtime*' }
+        @{ Name='.NET Desktop 8 x86'; Url='https://aka.ms/dotnet/8.0/windowsdesktop-runtime-win-x86.exe'; File='ndp-x86.exe'; Orphan=$null }
+        @{ Name='.NET Desktop 8 x64'; Url='https://aka.ms/dotnet/8.0/windowsdesktop-runtime-win-x64.exe'; File='ndp-x64.exe'; Orphan=$null }
+    )
+    $reboot = $false
+    foreach ($pkg in $pkgs) {
+        # Only touch what is actually failing.
+        $needed = switch -Wildcard ($pkg.Name) {
+            'VC++ x86*'          { -not (Test-RuntimeOk -Kind 'vcx86') }
+            'VC++ x64*'          { -not (Test-RuntimeOk -Kind 'vcx64') }
+            '.NET Desktop 8 x86' { -not (Test-RuntimeOk -Kind 'netx86') }
+            '.NET Desktop 8 x64' { -not (Test-RuntimeOk -Kind 'netx64') }
+        }
+        if (-not $needed) { continue }
+        Write-Log "  Repairing $($pkg.Name)" 'WARNING'
+        if ($OrphanFound -and $pkg.Orphan) { Remove-OrphanedMsiRegistration -NamePattern $pkg.Orphan | Out-Null }
+        $target = Join-Path $work $pkg.File
+        if (-not (Invoke-Download -Url $pkg.Url -OutFile $target)) { continue }
+        $logFile = Join-Path $work ("{0}.log" -f ($pkg.File -replace '\.exe$',''))
+        try {
+            $p = Start-Process -FilePath $target -ArgumentList '/install','/quiet','/norestart','/log',"`"$logFile`"" -PassThru -Wait -ErrorAction Stop
+            switch ($p.ExitCode) {
+                0    { Write-Log "    $($pkg.Name): installed." }
+                3010 { Write-Log "    $($pkg.Name): installed, reboot required." 'WARNING'; $reboot = $true }
+                default {
+                    Write-Log "    $($pkg.Name): installer returned $($p.ExitCode)" 'ERROR'
+                    Select-String -LiteralPath (Get-ChildItem -LiteralPath $work -Filter "$([IO.Path]::GetFileNameWithoutExtension($logFile))*.log" -ErrorAction SilentlyContinue | ForEach-Object FullName) `
+                        -Pattern 'Error \d+|System Error \d+|return value 3' -ErrorAction SilentlyContinue |
+                        Select-Object -Last 4 | ForEach-Object { Write-Log ("      {0}" -f $_.Line.Trim()) 'WARNING' }
+                }
+            }
+        } catch { Write-Log "    could not launch $($pkg.Name) installer: $($_.Exception.Message)" 'ERROR' }
+    }
+    return $reboot
+}
+
+function Test-RuntimeOk {
+    param([Parameter(Mandatory)][ValidateSet('vcx86','vcx64','netx86','netx64')][string]$Kind)
+    switch ($Kind) {
+        'vcx86' { $f = Join-Path (Join-Path $env:SystemRoot 'SysWOW64') 'msvcp140.dll' }
+        'vcx64' { $f = Join-Path (Join-Path $env:SystemRoot 'System32') 'msvcp140.dll' }
+        default { $f = $null }
+    }
+    if ($f) {
+        if (-not (Test-Path -LiteralPath $f)) { return $false }
+        $v = ConvertTo-VersionOrNull (Get-Item -LiteralPath $f).VersionInfo.FileVersion
+        return ($v -and $v -ge $MinVCRedist)
+    }
+    $root = if ($Kind -eq 'netx64') { Join-Path $env:ProgramFiles 'dotnet\shared\Microsoft.WindowsDesktop.App' }
+            else { Join-Path ${env:ProgramFiles(x86)} 'dotnet\shared\Microsoft.WindowsDesktop.App' }
+    if (-not $root -or -not (Test-Path -LiteralPath $root)) { return $false }
+    $best = Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue |
+        ForEach-Object { ConvertTo-VersionOrNull $_.Name } |
+        Where-Object { $_ -and $_.Major -eq 8 } | Sort-Object -Descending | Select-Object -First 1
+    return ($best -and $best -ge $MinDotNet)
+}
+
+function Repair-AutoUpdatePolicy {
+    # Disabled, with the stream still pinned to LTSR so re-enabling checks
+    # later cannot drift the machine onto Current Release.
+    $values = [ordered]@{ AutoUpdateCheck = 'Disabled'; AutoUpdateStream = 'LTSR' }
+    $ok = $false
+    foreach ($key in @('HKLM:\SOFTWARE\WOW6432Node\Citrix\ICA Client\AutoUpdate',
+                       'HKLM:\SOFTWARE\Citrix\ICA Client\AutoUpdate')) {
+        try {
+            if (-not (Test-Path -LiteralPath $key)) { New-Item -Path $key -Force -ErrorAction Stop | Out-Null }
+            foreach ($e in $values.GetEnumerator()) {
+                New-ItemProperty -Path $key -Name $e.Key -Value $e.Value -PropertyType String -Force -ErrorAction Stop | Out-Null
+            }
+            Write-Log "  Auto-update policy set: $key -> AutoUpdateCheck=Disabled, AutoUpdateStream=LTSR"
+            $ok = $true
+        } catch { Write-Log "  could not write ${key}: $($_.Exception.Message)" 'WARNING' }
+    }
+    return $ok
+}
+
+function Repair-IcaAssociationNative {
+    # Republish under a non-advertised ProgID so launching stops triggering
+    # Windows Installer self-repair, and clear per-user overrides that would
+    # otherwise outrank the machine setting.
+    $ica = Get-CitrixRoots | ForEach-Object { Join-Path $_ 'ICA Client' } |
+        Where-Object { Test-Path -LiteralPath (Join-Path $_ 'wfcrun32.exe') } | Select-Object -First 1
+    if (-not $ica) { Write-Log '  cannot repair .ica: wfcrun32.exe not found' 'ERROR'; return $false }
+    $wfcrun32 = Join-Path $ica 'wfcrun32.exe'
+
+    $current = Get-DefaultValue -Path 'Registry::HKEY_CLASSES_ROOT\.ica'
+    $base = if ($current) { $current } else { 'Citrix.ICAClient' }
+    while ($base -match '\.NEW$') { $base = $base -replace '\.NEW$', '' }
+    $target = "$base.NEW"
+    $command = '"{0}" "%1"' -f $wfcrun32
+
+    try {
+        $cmdKey = "HKLM:\SOFTWARE\Classes\$target\shell\open\command"
+        New-Item -Path $cmdKey -Force -ErrorAction Stop | Out-Null
+        Set-ItemProperty -LiteralPath $cmdKey -Name '(default)' -Value $command -ErrorAction Stop
+        Set-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Classes\$target" -Name '(default)' -Value 'Citrix ICA Client' -ErrorAction SilentlyContinue
+        New-Item -Path 'HKLM:\SOFTWARE\Classes\.ica' -Force -ErrorAction Stop | Out-Null
+        Set-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Classes\.ica' -Name '(default)' -Value $target -ErrorAction Stop
+        Set-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Classes\.ica' -Name 'Content Type' -Value 'application/x-ica' -ErrorAction SilentlyContinue
+        Write-Log "  .ica repointed -> $target -> $command"
+    } catch {
+        Write-Log "  could not write the .ica association: $($_.Exception.Message)" 'ERROR'
+        return $false
+    }
+
+    foreach ($sid in (Get-LoadedUserHives)) {
+        foreach ($p in @("Registry::HKEY_USERS\$sid\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\.ica\UserChoice",
+                         "Registry::HKEY_USERS\$sid\SOFTWARE\Classes\.ica")) {
+            if (-not (Test-Path -LiteralPath $p)) { continue }
+            try { Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction Stop
+                  Write-Log "  removed per-user override: $p" 'WARNING' }
+            catch { Write-Log "  could not remove ${p}: $($_.Exception.Message)" 'WARNING' }
+        }
+    }
+    Write-Log '  affected users must sign out and back in before Explorer picks this up.' 'WARNING'
+    return $true
+}
+
+function Remove-StaleShim {
+    $ica = Get-CitrixRoots | ForEach-Object { Join-Path $_ 'ICA Client' } |
+        Where-Object { Test-Path -LiteralPath (Join-Path $_ 'wfcrun32.exe') } | Select-Object -First 1
+    if (-not $ica) { return $false }
+    $removed = $false
+    foreach ($dll in @('msvcp140.dll','vcruntime140.dll')) {
+        $p = Join-Path $ica $dll
+        if (-not (Test-Path -LiteralPath $p)) { continue }
+        try { Remove-Item -LiteralPath $p -Force -ErrorAction Stop
+              Write-Log "  removed stale app-local shim: $p" 'WARNING'; $removed = $true }
+        catch { Write-Log "  could not remove ${p}: $($_.Exception.Message)" 'WARNING' }
+    }
+    return $removed
+}
+
 function Invoke-Fixes {
     param([Parameter(Mandatory)][string[]]$Keys)
-    $dir = Split-Path -Parent $PSCommandPath
-    if (-not $dir) { Write-Log 'Cannot resolve script folder; -Fix unavailable.' 'ERROR'; return }
+    $rebootNeeded = $false
 
-    # Dependency order: runtime first (nothing else works if CWA crashes on
-    # launch), then policy, then associations.
-    $plan = @(
-        @{ Key='prereq-orphan'; Script='Install-CitrixPrerequisites.ps1'; Args=@('-RemoveOrphanedRegistration') }
-        @{ Key='prereq';        Script='Install-CitrixPrerequisites.ps1'; Args=@() }
-        @{ Key='reinstall';     Script='Reinstall-CitrixLTSR.ps1';        Args=@() }
-        @{ Key='autoupdate';    Script='Set-CitrixAutoUpdate.ps1';        Args=@() }
-        @{ Key='ica';           Script='Repair-IcaAssociation.ps1';       Args=@() }
-    )
-    $ran = @()
-    foreach ($step in $plan) {
-        if ($Keys -notcontains $step.Key) { continue }
-        if ($ran -contains $step.Script) { continue }   # orphan variant supersedes plain prereq
-        $path = Join-Path $dir $step.Script
-        if (-not (Test-Path -LiteralPath $path)) {
-            Write-Log "Cannot fix '$($step.Key)': $($step.Script) not found beside this script." 'ERROR'
-            continue
-        }
-        Write-Log ("--- Fix: {0} {1} ---" -f $step.Script, ($step.Args -join ' ')) 'WARNING'
-        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $path @($step.Args)
-        Write-Log ("    exit code: {0}" -f $LASTEXITCODE) 'WARNING'
-        $ran += $step.Script
+    # Order matters: runtime first (nothing downstream works while CWA crashes
+    # on launch), then policy, then associations, then shim cleanup last so it
+    # is only removed once the system runtime is actually good.
+    if ($Keys -contains 'prereq' -or $Keys -contains 'prereq-orphan') {
+        Write-Log '--- Fix: runtime prerequisites ---' 'WARNING'
+        $rebootNeeded = Repair-RuntimePrereq -OrphanFound ($Keys -contains 'prereq-orphan')
     }
-    if (-not $ran) { Write-Log 'No automatic fix available for the reported failures.' 'WARNING' }
+    if ($Keys -contains 'reinstall') {
+        Write-Log '--- Fix: Citrix Workspace reinstall ---' 'WARNING'
+        $dir = Split-Path -Parent $PSCommandPath
+        $sib = if ($dir) { Join-Path $dir 'Reinstall-CitrixLTSR.ps1' } else { $null }
+        if ($sib -and (Test-Path -LiteralPath $sib)) {
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $sib
+            Write-Log ("  Reinstall-CitrixLTSR.ps1 exit code: {0}" -f $LASTEXITCODE) 'WARNING'
+        } else {
+            Write-Log '  Reinstall-CitrixLTSR.ps1 not found beside this script; a reinstall cannot be performed here.' 'ERROR'
+            Write-Log '  Deploy that script alongside this one, or run the WS1 Citrix package.' 'ERROR'
+        }
+    }
+    if ($Keys -contains 'autoupdate') {
+        Write-Log '--- Fix: auto-update policy ---' 'WARNING'
+        Repair-AutoUpdatePolicy | Out-Null
+    }
+    if ($Keys -contains 'ica') {
+        Write-Log '--- Fix: .ica association ---' 'WARNING'
+        Repair-IcaAssociationNative | Out-Null
+    }
+    if ($Keys -contains 'shim') {
+        Write-Log '--- Fix: stale app-local runtime shim ---' 'WARNING'
+        if (Test-RuntimeOk -Kind 'vcx86') { Remove-StaleShim | Out-Null }
+        else { Write-Log '  system runtime is still below minimum; leaving the shim in place.' 'WARNING' }
+    }
+    if ($rebootNeeded) { Write-Log 'A reboot is required to finalize the runtime changes.' 'WARNING' }
 }
 
 # ---------------------------------------------------------------------------

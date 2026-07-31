@@ -12,8 +12,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File Test-CitrixHealth.ps1
 ```
 
 `Test-CitrixHealth.ps1` is read-only and checks every failure mode below in one
-pass, printing the exact remedy for each problem it finds. Add `-Fix` to have it
-invoke the relevant repair scripts in dependency order.
+pass, printing the exact remedy for each problem it finds. Add `-Fix` and it
+repairs them itself — the repairs are built in, so the script works deployed on
+its own. Only a full CWA reinstall needs `Reinstall-CitrixLTSR.ps1` beside it.
 
 Exit codes across the toolkit: `0` healthy, `1` warnings, `2` action needed,
 `3` timeout / unsupported (varies by script — see each header).
@@ -22,7 +23,7 @@ Exit codes across the toolkit: `0` healthy, `1` warnings, `2` action needed,
 
 | Script | Purpose |
 |---|---|
-| `Test-CitrixHealth.ps1` | One-pass health check of everything below. `-Fix` delegates repairs. |
+| `Test-CitrixHealth.ps1` | One-pass health check of everything below. `-Fix` repairs them natively (self-contained). **Start here.** |
 | `Reinstall-CitrixLTSR.ps1` | Forced reinstall of CWA LTSR. Sources the installer from `-InstallerPath` → payload beside the script → `-SharePath` → winget. Sets auto-update policy. |
 | `Install-CitrixPrerequisites.ps1` | Verifies/repairs VC++ and .NET Desktop runtimes. Escalates install → repair → source-repair → `-RemoveOrphanedRegistration`. `-ShimAppLocal` unblocks Citrix without touching the system runtime. |
 | `Repair-IcaAssociation.ps1` | Republishes `.ica` under a non-advertised ProgID to stop MSI self-repair prompting non-admins for credentials. |
