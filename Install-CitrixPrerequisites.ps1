@@ -40,7 +40,8 @@
 
     Exit codes (WS1):
       0 = all prerequisites met (already, or after install)
-      1 = met but a reboot is required to finalize, or app-local DLLs found
+      1 = met but a reboot is required to finalize, or app-local DLLs found,
+          or the shim was requested and could not be fully applied
       2 = fatal (not elevated, download failed, still below minimum after
           install)
       3 = -CheckOnly and at least one prerequisite is below minimum
@@ -48,13 +49,35 @@
 .PARAMETER CheckOnly
     Report only; install nothing. Use as a WS1 detection rule.
 
+.PARAMETER ForceReinstall
+    For a VC++ package whose repair failed: uninstall it and install fresh.
+    Heavier than /repair -- other applications depend on this runtime, so
+    there is a window between uninstall and install where they would fail to
+    start. Use when /repair returns 1603 and a reboot has not helped.
+
+.PARAMETER ShimAppLocal
+    Workaround that does not depend on fixing the system runtime at all:
+    copy a known-good msvcp140.dll / vcruntime140.dll (taken from the Citrix
+    install itself) into the folder containing wfcrun32.exe. Windows resolves
+    app-local DLLs before the system ones, so CWA binds the good copy while
+    SysWOW64 stays as-is. This is Microsoft's documented "local deployment"
+    model and is exactly what Citrix already does for its own subfolders on
+    this machine. Reversible: delete the two files from the ICA Client folder.
+    Affects only Citrix, not other applications.
+
 .PARAMETER DryRun
     Log what would be downloaded/installed without doing it.
 
 .NOTES
     Author  : MEB -- Oak Street Health / CVS Health IT Operations
-    Version : 1.1.0
+    Version : 1.2.0
     Date    : 2026-07-31
+    v1.2.0  : /repair returned 1603 on HCDL-BP0WCW3 and left the DLL stale.
+              Added: bundle+MSI logging on every install/repair with the real
+              error surfaced (1603 alone says nothing); -ForceReinstall
+              (uninstall then install); and -ShimAppLocal, which places a
+              known-good runtime next to wfcrun32.exe so Citrix works without
+              the system runtime being fixed at all.
     v1.1.0  : FALSE-PASS FIX. v1.0.0 accepted the better of the registry
               version and the on-disk DLL, so HCDL-BP0WCW3 reported "all
               prerequisites met" while SysWOW64\msvcp140.dll was still
@@ -72,10 +95,12 @@
 [CmdletBinding()]
 param(
     [switch]$CheckOnly,
+    [switch]$ForceReinstall,
+    [switch]$ShimAppLocal,
     [switch]$DryRun
 )
 
-$ScriptVersion     = '1.1.0'
+$ScriptVersion     = '1.2.0'
 $DestinationFolder = 'C:\drop\citrix'
 $WorkDir           = Join-Path $DestinationFolder 'prereqs'
 $LogRetainDays     = 30
@@ -285,17 +310,19 @@ function Install-Prereq {
     # Returns 'ok' | 'reboot' | 'fail'
     param(
         [Parameter(Mandatory)][hashtable]$Item,
-        [ValidateSet('install','repair')][string]$Action = 'install'
+        [ValidateSet('install','repair','uninstall')][string]$Action = 'install'
     )
     $target = Join-Path $WorkDir $Item.File
     if (-not (Invoke-Download -Url $Item.Url -OutFile $target)) { return 'fail' }
     # /repair rewrites files the package owns. /install would return 1638
     # ("newer version already installed") and leave the stale DLL in place.
-    $verb = if ($Action -eq 'repair') { '/repair' } else { '/install' }
-    Write-Log "  Running $verb (package is registered as current but its DLL on disk is stale)" `
-        $(if ($Action -eq 'repair') { 'WARNING' } else { 'INFO' })
+    $verb = if ($Action -eq 'repair') { '/repair' } elseif ($Action -eq 'uninstall') { '/uninstall' } else { '/install' }
+    # Always capture a bundle log; 1603 is generic and the real cause only
+    # appears in the MSI log Burn writes alongside it.
+    $logBase = Join-Path $WorkDir ("{0}_{1}.log" -f ($Item.Key), $Action)
+    Write-Log "  Running $verb  (log: $logBase)" $(if ($Action -eq 'repair') { 'WARNING' } else { 'INFO' })
     try {
-        $p = Start-Process -FilePath $target -ArgumentList $verb,'/quiet','/norestart' -PassThru -Wait -ErrorAction Stop
+        $p = Start-Process -FilePath $target -ArgumentList $verb,'/quiet','/norestart','/log',"`"$logBase`"" -PassThru -Wait -ErrorAction Stop
         $code = $p.ExitCode
     } catch {
         Write-Log "  Failed to launch installer: $($_.Exception.Message)" 'ERROR'
@@ -306,8 +333,90 @@ function Install-Prereq {
         3010  { Write-Log "  $($Item.Name): $Action succeeded, reboot required (3010)." 'WARNING'; return 'reboot' }
         1638  { Write-Log "  $($Item.Name): package reports a newer version already present (1638)." 'WARNING'; return 'ok' }
         5100  { Write-Log "  $($Item.Name): package reports a newer version already present (5100)." 'WARNING'; return 'ok' }
-        default { Write-Log "  $($Item.Name): installer returned $code." 'ERROR'; return 'fail' }
+        default {
+            Write-Log "  $($Item.Name): installer returned $code." 'ERROR'
+            Write-BundleLogErrors -LogBase $logBase
+            return 'fail'
+        }
     }
+}
+
+function Write-BundleLogErrors {
+    # Surface the actual failure out of the Burn/MSI logs so 1603 stops being
+    # an opaque number. Burn writes siblings like <base>_000_vcRuntime...log.
+    param([Parameter(Mandatory)][string]$LogBase)
+    $dir  = Split-Path -Path $LogBase -Parent
+    $stem = [IO.Path]::GetFileNameWithoutExtension($LogBase)
+    $logs = Get-ChildItem -LiteralPath $dir -Filter "$stem*.log" -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending
+    if (-not $logs) { Write-Log '  (no bundle log was produced)' 'WARNING'; return }
+    foreach ($l in $logs) {
+        $hits = Select-String -LiteralPath $l.FullName -ErrorAction SilentlyContinue `
+            -Pattern 'Error \d+|return value 3|MainEngineThread is returning|Failed to |cannot access|being used by another process|Product: .*-- Error' |
+            Select-Object -Last 8
+        if ($hits) {
+            Write-Log "  --- from $($l.Name) ---" 'WARNING'
+            foreach ($h in $hits) { Write-Log ("    {0}" -f ($h.Line.Trim())) 'WARNING' }
+        }
+    }
+    Write-Log "  Full logs: $dir" 'WARNING'
+}
+
+function Invoke-AppLocalShim {
+    # Put a known-good runtime next to wfcrun32.exe. Windows checks the
+    # application directory before the system directories, so CWA binds this
+    # copy regardless of what SysWOW64 holds. Only Citrix is affected.
+    # Returns $true if the shim is in place.
+    $icaDir = @((Join-Path ${env:ProgramFiles(x86)} 'Citrix\ICA Client'),
+                (Join-Path $env:ProgramFiles 'Citrix\ICA Client')) |
+        Where-Object { $_ -and (Test-Path -LiteralPath (Join-Path $_ 'wfcrun32.exe')) } |
+        Select-Object -First 1
+    if (-not $icaDir) {
+        Write-Log 'Cannot shim: wfcrun32.exe not found.' 'ERROR'
+        return $false
+    }
+    Write-Log "Shim target (folder holding wfcrun32.exe): $icaDir"
+
+    $ok = $true
+    foreach ($dll in @('msvcp140.dll','vcruntime140.dll')) {
+        # Source: the newest copy Citrix already ships that meets the minimum.
+        $src = Find-AppLocalRuntimeDlls |
+            Where-Object { (Split-Path $_.Path -Leaf) -ieq $dll -and $_.Version -and $_.Version -ge $MinVCRedist } |
+            Sort-Object Version -Descending | Select-Object -First 1
+        if (-not $src) {
+            Write-Log "  No source copy of $dll at >= $MinVCRedist found inside the Citrix tree." 'ERROR'
+            $ok = $false; continue
+        }
+        $dest = Join-Path $icaDir $dll
+        if (Test-Path -LiteralPath $dest) {
+            $existing = ConvertTo-VersionOrNull (Get-Item -LiteralPath $dest).VersionInfo.FileVersion
+            if ($existing -and $existing -ge $MinVCRedist) {
+                Write-Log "  $dll already present at v$existing; leaving it."
+                continue
+            }
+            $backup = "$dest.bak"
+            if ($DryRun) { Write-Log "  [DRYRUN] Would back up $dest -> $backup" 'WARNING' }
+            else { Copy-Item -LiteralPath $dest -Destination $backup -Force -ErrorAction SilentlyContinue
+                   Write-Log "  Backed up existing $dll -> $backup" }
+        }
+        if ($DryRun) {
+            Write-Log "  [DRYRUN] Would copy $($src.Path) (v$($src.Version)) -> $dest" 'WARNING'
+            continue
+        }
+        try {
+            Copy-Item -LiteralPath $src.Path -Destination $dest -Force -ErrorAction Stop
+            $now = ConvertTo-VersionOrNull (Get-Item -LiteralPath $dest).VersionInfo.FileVersion
+            Write-Log "  Copied $dll v$now from $($src.Path)"
+        } catch {
+            Write-Log "  Failed to copy ${dll}: $($_.Exception.Message)" 'ERROR'
+            $ok = $false
+        }
+    }
+    if ($ok -and -not $DryRun) {
+        Write-Log 'App-local shim in place. CWA will now load the good runtime even though SysWOW64 is still stale.'
+        Write-Log "To undo: delete msvcp140.dll and vcruntime140.dll from $icaDir (restore any .bak files)."
+    }
+    return $ok
 }
 
 # ---------------------------------------------------------------------------
@@ -347,6 +456,15 @@ try {
         Write-Log 'App-local DLLs are reported only, never removed automatically -- some are shipped by Citrix on purpose.' 'WARNING'
     }
 
+    # Shim first when asked: it is independent of the system runtime and gets
+    # Citrix working even if every install/repair below fails.
+    $shimDone = $false
+    if ($ShimAppLocal -and -not $CheckOnly) {
+        Write-Log '--- App-local shim (Citrix only) ---'
+        $shimDone = Invoke-AppLocalShim
+        if (-not $shimDone) { $exit = [math]::Max($exit, 1) }
+    }
+
     $needed = @($Prereqs | Where-Object { -not (Test-PrereqMet -State $state -Key $_.Key) })
 
     if (-not $needed) {
@@ -377,7 +495,14 @@ try {
     $rebootNeeded = $false; $failed = @()
     foreach ($item in $needed) {
         $action = Get-PrereqAction -State $state -Key $item.Key
-        Write-Log "$($item.Name)  [action: $action]:"
+        if ($ForceReinstall -and $item.Key -in @('vcx64','vcx86')) {
+            Write-Log "$($item.Name)  [action: uninstall then install (-ForceReinstall)]:" 'WARNING'
+            Write-Log '  Other applications share this runtime and may fail to start until the install completes.' 'WARNING'
+            Install-Prereq -Item $item -Action 'uninstall' | Out-Null
+            $action = 'install'
+        } else {
+            Write-Log "$($item.Name)  [action: $action]:"
+        }
         switch (Install-Prereq -Item $item -Action $action) {
             'reboot' { $rebootNeeded = $true }
             'fail'   { $failed += $item.Name }
@@ -394,8 +519,14 @@ try {
     if ($still) {
         Write-Log ("STILL below minimum: {0}" -f (($still | ForEach-Object { $_.Name }) -join '; ')) 'ERROR'
         if ($still | Where-Object { $_.Key -in @('vcx64','vcx86') }) {
-            Write-Log 'A VC++ system DLL is still stale after a repair. Something outside the redistributable is overwriting it (an older app that drops msvcp140.dll into SysWOW64, or a pending-rename that needs a reboot).' 'ERROR'
-            Write-Log 'Next steps: reboot and re-run this script; if it persists, uninstall the VC++ 2015-2022 x86 redistributable from Programs and Features, reboot, then re-run.' 'ERROR'
+            Write-Log 'A VC++ system DLL is still stale. Something outside the redistributable is holding or replacing it (a process with the DLL loaded, a pending file-rename awaiting reboot, or a missing MSI cache entry).' 'ERROR'
+            Write-Log 'Escalation order: (1) reboot and re-run; (2) re-run with -ForceReinstall; (3) re-run with -ShimAppLocal to unblock Citrix without touching the system runtime.' 'ERROR'
+            if (-not $ShimAppLocal) {
+                Write-Log 'TIP: -ShimAppLocal fixes Citrix immediately and independently of this failure.' 'WARNING'
+            }
+        }
+        if ($shimDone) {
+            Write-Log 'The app-local shim IS in place, so Citrix should launch despite the system runtime still being stale. Exit code stays 2 because the machine-level problem is unresolved.' 'WARNING'
         }
         $exit = 2
     } elseif ($rebootNeeded) {
