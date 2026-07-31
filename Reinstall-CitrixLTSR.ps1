@@ -976,9 +976,17 @@ try {
                 $handler = (Get-ItemProperty "Registry::HKCR\$icaDefault\shell\open\command" -ErrorAction SilentlyContinue).'(default)'
             }
             if ($handler -and $handler -match 'wfcrun32|CDViewer') {
-                Write-Log ".ica association verified: $icaDefault -> $handler"
+                Write-Log ".ica association present: $icaDefault -> $handler"
+                # Registry-level only. Per Citrix CTX267718 the association can
+                # be bound to an advertised MSI component and still trigger
+                # Windows Installer self-repair on launch (non-admin users get
+                # an admin credential prompt) while looking exactly like this.
+                # If users report that, run Repair-IcaAssociation.ps1.
+                if ($icaDefault -notmatch '\.NEW$') {
+                    Write-Log 'This is a registry check only; it cannot detect MSI-advertised association corruption (CTX267718). If users are prompted for admin credentials at launch, run Repair-IcaAssociation.ps1.'
+                }
                 if ($installerSkipped) {
-                    Write-Log 'Client was already current and healthy; no reinstall was needed.'
+                    Write-Log 'Client was already current; no reinstall was needed.'
                 }
             } else {
                 Write-Log ".ica association still looks wrong (ProgID: '$icaDefault', handler: '$handler')." 'WARNING'
