@@ -70,8 +70,16 @@
 
 .NOTES
     Author  : MEB -- Oak Street Health / CVS Health IT Operations
-    Version : 1.3.0
+    Version : 1.4.0
     Date    : 2026-07-31
+    v1.4.0  : The captured MSI log on HCDL-BP0WCW3 showed the real cause:
+              "SOURCEMGMT: Failed to resolve source" + Error 1714 / System
+              Error 1612 -- the package cached under C:\Windows\Installer is
+              gone, so Windows Installer cannot repair, upgrade OR remove the
+              runtime and every bundle action dies in RemoveExistingProducts.
+              Added a source-repair escalation step: extract the bundle with
+              /layout and run msiexec /fvomus against the extracted MSI, which
+              re-caches the package from a real source and rewrites the files.
     v1.3.0  : Remediation now ESCALATES and verifies the on-disk DLL after
               each step instead of trusting the exit code. /install is tried
               FIRST: the bundle at aka.ms (14.44) is newer than what is
@@ -108,7 +116,7 @@ param(
     [switch]$DryRun
 )
 
-$ScriptVersion     = '1.3.0'
+$ScriptVersion     = '1.4.0'
 $DestinationFolder = 'C:\drop\citrix'
 $WorkDir           = Join-Path $DestinationFolder 'prereqs'
 $LogRetainDays     = 30
@@ -260,6 +268,69 @@ function Test-PrereqMet {
     return $false
 }
 
+function Repair-FromExtractedSource {
+    # For MSI System Error 1612 / "SOURCEMGMT: Failed to resolve source":
+    # the package cached under C:\Windows\Installer is gone, so Windows
+    # Installer cannot repair, upgrade or remove the product -- every bundle
+    # action dies in RemoveExistingProducts with 1714/1603.
+    #
+    # /layout extracts the real MSIs and CABs out of the bundle, giving the
+    # installer a valid source again. msiexec /fvomus then RE-CACHES the
+    # package from that source (that is what the 'v' does) and rewrites every
+    # file, which is exactly what the stale msvcp140.dll needs.
+    param([Parameter(Mandatory)][hashtable]$Item)
+
+    $bundle = Join-Path $WorkDir $Item.File
+    if (-not (Test-Path -LiteralPath $bundle)) {
+        if (-not (Invoke-Download -Url $Item.Url -OutFile $bundle)) { return $false }
+    }
+    $layout = Join-Path $WorkDir ('layout_' + $Item.Key)
+    if (Test-Path -LiteralPath $layout) { Remove-Item -LiteralPath $layout -Recurse -Force -ErrorAction SilentlyContinue }
+    New-Item -Path $layout -ItemType Directory -Force | Out-Null
+
+    Write-Log "  Extracting installer layout to $layout"
+    try {
+        $p = Start-Process -FilePath $bundle -ArgumentList '/layout',"`"$layout`"",'/quiet','/norestart' `
+             -PassThru -Wait -ErrorAction Stop
+        if ($p.ExitCode -ne 0) { Write-Log "  /layout returned $($p.ExitCode)." 'WARNING' }
+    } catch {
+        Write-Log "  Could not extract layout: $($_.Exception.Message)" 'ERROR'
+        return $false
+    }
+
+    $msis = Get-ChildItem -LiteralPath $layout -Recurse -Filter '*.msi' -ErrorAction SilentlyContinue
+    if (-not $msis) { Write-Log '  No MSI found in the extracted layout.' 'ERROR'; return $false }
+
+    $any = $false
+    foreach ($msi in $msis) {
+        # f=repair v=re-cache from this source o=replace older/missing files
+        # m/u=rewrite machine+user registration s=shortcuts
+        $msiLog = Join-Path $WorkDir ("{0}_source_{1}.log" -f $Item.Key, $msi.BaseName)
+        Write-Log "  msiexec /fvomus `"$($msi.Name)`"  (re-caching package from extracted source)"
+        try {
+            $mp = Start-Process -FilePath 'msiexec.exe' `
+                  -ArgumentList '/fvomus',"`"$($msi.FullName)`"",'/quiet','/norestart','/l*v',"`"$msiLog`"" `
+                  -PassThru -Wait -ErrorAction Stop
+            $code = $mp.ExitCode
+        } catch {
+            Write-Log "  Failed to launch msiexec: $($_.Exception.Message)" 'ERROR'
+            continue
+        }
+        switch ($code) {
+            0     { Write-Log "    $($msi.Name): re-cached and repaired (exit 0)."; $any = $true }
+            3010  { Write-Log "    $($msi.Name): repaired, reboot required (3010)." 'WARNING'; $any = $true }
+            1605  { Write-Log "    $($msi.Name): not currently installed (1605); skipping." 'WARNING' }
+            default {
+                Write-Log "    $($msi.Name): msiexec returned $code." 'WARNING'
+                $hits = Select-String -LiteralPath $msiLog -ErrorAction SilentlyContinue `
+                        -Pattern 'Error \d+|return value 3|MainEngineThread is returning' | Select-Object -Last 4
+                foreach ($h in $hits) { Write-Log ("      {0}" -f $h.Line.Trim()) 'WARNING' }
+            }
+        }
+    }
+    return $any
+}
+
 function Invoke-PrereqRemediation {
     # v1.3.0: escalate, verifying the ON-DISK DLL after each step rather than
     # trusting the installer's exit code.
@@ -275,11 +346,17 @@ function Invoke-PrereqRemediation {
     # Returns 'ok' | 'reboot' | 'fail'.
     param([Parameter(Mandatory)][hashtable]$Item)
     $steps = @('install','repair')
+    # sourcerepair only applies to the VC++ bundles (the .NET runtime bundle
+    # has no /layout-and-recache equivalent worth attempting here).
+    if ($Item.Key -in @('vcx64','vcx86')) { $steps += 'sourcerepair' }
     if ($ForceReinstall -and $Item.Key -in @('vcx64','vcx86')) { $steps += 'forcereinstall' }
     $reboot = $false
 
     foreach ($step in $steps) {
-        if ($step -eq 'forcereinstall') {
+        if ($step -eq 'sourcerepair') {
+            Write-Log '  Escalating: extracting the installer layout and re-caching the MSI from it (fixes System Error 1612 / missing C:\Windows\Installer cache).' 'WARNING'
+            $result = if (Repair-FromExtractedSource -Item $Item) { 'ok' } else { 'fail' }
+        } elseif ($step -eq 'forcereinstall') {
             Write-Log '  Escalating to uninstall + install. Other applications share this runtime and may fail to start until it completes.' 'WARNING'
             Install-Prereq -Item $Item -Action 'uninstall' | Out-Null
             $result = Install-Prereq -Item $Item -Action 'install'
