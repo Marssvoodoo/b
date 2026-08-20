@@ -52,8 +52,15 @@
 
 .NOTES
     Author  : MEB -- Oak Street Health / CVS Health IT Operations
-    Version : 1.0.0
+    Version : 1.1.0
     Date    : 2026-08-20
+    v1.1.0  : Rank mechanisms by how directly they name a culprit rather than
+              by item count -- on HCDL-9N44WH3 the first run buried the real
+              answer (4 downloaded installers) under 27 corroborating log
+              folders and 28 install events. Also stopped printing an empty
+              "(client PID )" for 1033 events, which carry no PID, and now
+              calls out a management cache holding an APPROVED LTSR payload,
+              since that is the deployment that should be running.
     Context : NT AUTHORITY\SYSTEM (WS1 Device context) or elevated admin
     PowerShell 5.1 compatible. Logs to C:\drop\citrix.
     Run this BEFORE uninstalling again -- an install that is still present
@@ -66,7 +73,7 @@ param(
     [string]$LtsrPrefix = '25.7.'
 )
 
-$ScriptVersion     = '1.0.0'
+$ScriptVersion     = '1.1.0'
 $DestinationFolder = 'C:\drop\citrix'
 $LogRetainDays     = 30
 
@@ -211,7 +218,8 @@ function Find-InstallEvents {
         }
         if ($cpid) { $pids[$cpid] = $true }
         if ($e.Id -in @(1033,11707) -and $name -match 'Citrix' -and (Test-IsDrift $ver)) {
-            Add-Finding -Mechanism 'install event' -Evidence ("{0:yyyy-MM-dd HH:mm} {1} {2} installed (client PID {3})" -f $e.TimeCreated, $name, $ver, $cpid) -Version $ver
+            $pidNote = if ($cpid) { " (client PID $cpid)" } else { '' }
+            Add-Finding -Mechanism 'install event' -Evidence ("{0:yyyy-MM-dd HH:mm} {1} {2} installed{3}" -f $e.TimeCreated, $name, $ver, $pidNote) -Version $ver
         }
     }
     if ($pids.Keys.Count) {
@@ -269,7 +277,13 @@ function Find-ManagementCaches {
         foreach ($h in $hits) {
             $any = $true
             $v = $h.VersionInfo.FileVersion
-            Write-Log ("    PAYLOAD: {0}  v{1}  (modified {2:yyyy-MM-dd HH:mm})" -f $h.FullName, $v, $h.LastWriteTime) 'ERROR'
+            $isApproved = -not (Test-IsDrift $v)
+            Write-Log ("    PAYLOAD: {0}  v{1}  (modified {2:yyyy-MM-dd HH:mm}){3}" -f `
+                $h.FullName, $v, $h.LastWriteTime, $(if ($isApproved) { '   <-- APPROVED LTSR payload' } else { '   <-- NON-LTSR payload' })) `
+                $(if ($isApproved) { 'WARNING' } else { 'ERROR' })
+            if ($isApproved) {
+                Write-Log ("    {0} already holds an approved LTSR installer. If Citrix is not installed, that deployment is not running -- check the assignment before blaming anything else." -f $r.Name) 'WARNING'
+            }
             Add-Finding -Mechanism "$($r.Name) push" -Evidence $h.FullName -Version $v
         }
     }
@@ -395,7 +409,27 @@ try {
         Write-Log '  path, which is the single most direct answer.'
     } else {
         $exit = 1
-        $byMech = $script:Findings | Group-Object Mechanism | Sort-Object Count -Descending
+        # Rank by how directly a mechanism names a culprit, NOT by item count.
+        # Corroborating traces (installer log folders, install events) are the
+        # most numerous and the least actionable, so counting would bury the
+        # answer -- 27 log folders outranking 4 downloaded installers tells you
+        # nothing useful.
+        $weight = @{
+            'USER self-install (downloaded)' = 100
+            'USER self-install (from temp)'  = 95
+            'ConfigMgr/SCCM push'            = 90
+            'Workspace ONE push'             = 90
+            'Intune push'                    = 90
+            'network share'                  = 70
+            'scheduled task'                 = 60
+            'service'                        = 50
+            'unclassified path'              = 40
+            'installer log directory'        = 10
+            'install event'                  = 5
+        }
+        $byMech = $script:Findings | Group-Object Mechanism |
+            Sort-Object @{Expression={ if ($weight.ContainsKey($_.Name)) { $weight[$_.Name] } else { 30 } }; Descending=$true},
+                        @{Expression='Count'; Descending=$true}
         foreach ($g in $byMech) {
             Write-Log ("  {0}  ({1} item(s))" -f $g.Name, $g.Count) 'WARNING'
             foreach ($f in ($g.Group | Select-Object -First 4)) {
