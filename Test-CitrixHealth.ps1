@@ -66,11 +66,21 @@
     orphaned MSI registration (registry exported first), auto-update policy,
     .ica association plus per-user overrides, stale shim removal.
 
-    The one exception is a full CWA reinstall, which delegates to
-    Reinstall-CitrixLTSR.ps1 if it sits beside this script; if it does not,
-    that single item is reported rather than performed.
+    A full CWA install is also performed natively (see -InstallerPath), so
+    nothing is left unfixable. When Reinstall-CitrixLTSR.ps1 happens to sit
+    beside this script it is preferred for that one step, since it adds richer
+    installer sourcing, MSI mutex handling and hash verification.
 
     Nothing is changed unless -Fix is passed.
+
+.PARAMETER InstallerPath
+    Explicit CitrixWorkspaceApp.exe for -Fix to install from. Otherwise a
+    payload beside this script is used, then winget.
+
+.PARAMETER WingetId
+    winget package id used when -Fix has to fetch the installer. Defaults to
+    Citrix.Workspace.LTSR -- the LTSR manifest. Do NOT point this at
+    Citrix.Workspace, which is the Current Release track.
 
 .PARAMETER EventHours
     How far back to look for crash events. Default 24.
@@ -80,8 +90,12 @@
 
 .NOTES
     Author  : MEB -- Oak Street Health / CVS Health IT Operations
-    Version : 1.1.0
-    Date    : 2026-07-31
+    Version : 1.2.0
+    Date    : 2026-08-20
+    v1.2.0  : -Fix can now install CWA itself (-InstallerPath / payload beside
+              the script / winget Citrix.Workspace.LTSR), so a standalone
+              deployment is no longer left unable to install. Reinstall-
+              CitrixLTSR.ps1 is still preferred when present.
     v1.1.0  : -Fix repairs natively instead of delegating, so the script is
               self-contained when deployed alone. Only the full CWA reinstall
               still needs a sibling script.
@@ -94,11 +108,13 @@
 [CmdletBinding()]
 param(
     [switch]$Fix,
+    [string]$InstallerPath = '',
+    [string]$WingetId = 'Citrix.Workspace.LTSR',
     [int]$EventHours = 24,
     [switch]$Quiet
 )
 
-$ScriptVersion     = '1.1.0'
+$ScriptVersion     = '1.2.0'
 $DestinationFolder = 'C:\drop\citrix'
 $LogRetainDays     = 30
 
@@ -727,6 +743,94 @@ function Remove-StaleShim {
     return $removed
 }
 
+function Install-CwaNative {
+    # Install CWA LTSR without needing Reinstall-CitrixLTSR.ps1 present, so a
+    # standalone deployment of this script can actually install.
+    # Source order: -InstallerPath -> payload beside this script -> winget
+    # (Citrix.Workspace.LTSR, the LTSR manifest -- never Current Release).
+    # Auto-update is disabled on the command line so the machine cannot be
+    # offered Current Release again the moment it comes up.
+    $installer = $null
+
+    if ($InstallerPath) {
+        if (Test-Path -LiteralPath $InstallerPath) {
+            $installer = $InstallerPath
+            Write-Log "  installer (explicit): $installer"
+        } else {
+            Write-Log "  -InstallerPath specified but not found: $InstallerPath" 'ERROR'
+            return $false
+        }
+    }
+    if (-not $installer) {
+        $dir = Split-Path -Parent $PSCommandPath
+        if ($dir) {
+            $local = Get-ChildItem -LiteralPath $dir -Filter 'CitrixWorkspaceApp*.exe' -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($local) { $installer = $local.FullName; Write-Log "  installer (payload beside script): $installer" }
+        }
+    }
+    if (-not $installer) {
+        $wg = Get-Command winget.exe -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source -ErrorAction SilentlyContinue
+        if (-not $wg) {
+            $wg = Get-ChildItem -LiteralPath (Join-Path $env:ProgramFiles 'WindowsApps') -Filter 'Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe' -Directory -ErrorAction SilentlyContinue |
+                Sort-Object Name -Descending | ForEach-Object { Join-Path $_.FullName 'winget.exe' } |
+                Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+        }
+        $portable = Join-Path $DestinationFolder 'winget-portable\winget.exe'
+        if (-not $wg -and (Test-Path -LiteralPath $portable)) { $wg = $portable }
+        if (-not $wg) {
+            Write-Log '  no installer available and winget.exe was not found.' 'ERROR'
+            Write-Log '  Pass -InstallerPath, put CitrixWorkspaceApp*.exe beside this script, or repair winget first.' 'ERROR'
+            return $false
+        }
+        $dlDir = Join-Path $DestinationFolder 'health-winget-dl'
+        if (Test-Path -LiteralPath $dlDir) { Remove-Item -LiteralPath $dlDir -Recurse -Force -ErrorAction SilentlyContinue }
+        New-Item -Path $dlDir -ItemType Directory -Force | Out-Null
+        $wgArgs = "download --exact --id $WingetId --download-directory `"$dlDir`" --accept-package-agreements --accept-source-agreements --disable-interactivity"
+        Write-Log "  staging via winget: $wg $wgArgs"
+        try {
+            $p = Start-Process -FilePath $wg -ArgumentList $wgArgs -WorkingDirectory (Split-Path -Path $wg -Parent) `
+                 -PassThru -WindowStyle Hidden -ErrorAction Stop
+            $null = $p.Handle
+            if (-not $p.WaitForExit(900000)) {
+                & taskkill.exe /PID $p.Id /T /F 2>&1 | Out-Null
+                Write-Log '  winget download timed out after 900s.' 'ERROR'; return $false
+            }
+            if ($p.ExitCode -ne 0) { Write-Log "  winget download returned $($p.ExitCode)." 'ERROR'; return $false }
+        } catch { Write-Log "  could not run winget: $($_.Exception.Message)" 'ERROR'; return $false }
+        $exe = Get-ChildItem -LiteralPath $dlDir -Filter '*.exe' -Recurse -ErrorAction SilentlyContinue |
+            Sort-Object Length -Descending | Select-Object -First 1
+        if (-not $exe) { Write-Log '  winget download produced no installer.' 'ERROR'; return $false }
+        $installer = $exe.FullName
+        Write-Log "  installer (winget): $installer"
+    }
+
+    Unblock-File -LiteralPath $installer -ErrorAction SilentlyContinue
+    $cwaArgs = '/silent /forceinstall /noreboot /AutoUpdateCheck=disabled'
+    Write-Log "  running: `"$installer`" $cwaArgs"
+    try {
+        $ip = Start-Process -FilePath $installer -ArgumentList $cwaArgs -PassThru -ErrorAction Stop
+        $null = $ip.Handle
+        if (-not $ip.WaitForExit(1800000)) {
+            & taskkill.exe /PID $ip.Id /T /F 2>&1 | Out-Null
+            Write-Log '  CWA installer exceeded 1800s and was terminated.' 'ERROR'; return $false
+        }
+        $code = $ip.ExitCode
+        if ($null -eq $code) { $code = 0 }
+    } catch { Write-Log "  could not launch the CWA installer: $($_.Exception.Message)" 'ERROR'; return $false }
+
+    # Citrix installer exit codes per CTX695019.
+    switch ($code) {
+        0     { Write-Log '  CWA installed (exit 0).'; return $true }
+        3010  { Write-Log '  CWA installed; reboot required to finalize (3010).' 'WARNING'; return $true }
+        40032 { Write-Log '  CWA reports it is already up to date (40032); nothing was reinstalled.' 'WARNING'; return $true }
+        40026 { Write-Log '  installer could not stop processes/drivers (40026). Reboot and re-run.' 'ERROR'; return $false }
+        40034 { Write-Log '  Windows Installer failure (40034). Check %TEMP%\CTXWorkspaceInstallLogs.' 'ERROR'; return $false }
+        1603  { Write-Log '  fatal installer error 1603. Check %TEMP%\CTXWorkspaceInstallLogs.' 'ERROR'; return $false }
+        default { Write-Log "  CWA installer returned $code (see Citrix CTX695019)." 'ERROR'; return $false }
+    }
+}
+
 function Invoke-Fixes {
     param([Parameter(Mandatory)][string[]]$Keys)
     $rebootNeeded = $false
@@ -739,15 +843,19 @@ function Invoke-Fixes {
         $rebootNeeded = Repair-RuntimePrereq -OrphanFound ($Keys -contains 'prereq-orphan')
     }
     if ($Keys -contains 'reinstall') {
-        Write-Log '--- Fix: Citrix Workspace reinstall ---' 'WARNING'
+        Write-Log '--- Fix: Citrix Workspace install ---' 'WARNING'
+        # Prefer the full script when it is present (richer installer sourcing,
+        # MSI mutex handling, hash verification); otherwise install natively so
+        # a standalone deployment is not left unable to install anything.
         $dir = Split-Path -Parent $PSCommandPath
         $sib = if ($dir) { Join-Path $dir 'Reinstall-CitrixLTSR.ps1' } else { $null }
         if ($sib -and (Test-Path -LiteralPath $sib)) {
             & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $sib
             Write-Log ("  Reinstall-CitrixLTSR.ps1 exit code: {0}" -f $LASTEXITCODE) 'WARNING'
         } else {
-            Write-Log '  Reinstall-CitrixLTSR.ps1 not found beside this script; a reinstall cannot be performed here.' 'ERROR'
-            Write-Log '  Deploy that script alongside this one, or run the WS1 Citrix package.' 'ERROR'
+            Write-Log '  Reinstall-CitrixLTSR.ps1 not present; installing natively.' 'WARNING'
+            if (Install-CwaNative) { Write-Log '  CWA install completed.' }
+            else { Write-Log '  CWA install did not complete; see the errors above.' 'ERROR' }
         }
     }
     if ($Keys -contains 'autoupdate') {

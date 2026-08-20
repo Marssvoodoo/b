@@ -20,7 +20,7 @@
       4. .ica association at MACHINE level (HKLM\SOFTWARE\Classes).
       5. .ica association at PER-USER level (HKU\<SID>\SOFTWARE\Classes) --
          this OUTRANKS the machine association. A stale per-user entry pointing
-         into a removed per-user install path (…\AppData\Local\Citrix\…) makes
+         into a removed per-user install path (...\AppData\Local\Citrix\...) makes
          a launch do exactly nothing, silently.
       6. UserChoice overrides for .ica.
       7. receiver:// protocol handler registration (machine and per-user) --
@@ -35,7 +35,9 @@
     Output goes to the console and to C:\drop\citrix\Citrix-Diagnostics-*.log.
     Send that log back for analysis.
 
-    Exit codes: 0 = collected (always, unless it could not write a log).
+    Exit codes (WS1):
+      0 = diagnostics collected
+      2 = could not create the log directory, so nothing was collected
 
 .PARAMETER EventHours
     How far back to search the event log. Default 24.

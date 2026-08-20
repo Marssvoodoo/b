@@ -29,6 +29,7 @@ Exit codes across the toolkit: `0` healthy, `1` warnings, `2` action needed,
 | `Repair-IcaAssociation.ps1` | Republishes `.ica` under a non-advertised ProgID to stop MSI self-repair prompting non-admins for credentials. |
 | `Set-CitrixAutoUpdate.ps1` | Pins the Citrix Workspace Updater (default: disabled, stream LTSR). No reinstall needed. |
 | `Repair-Winget.ps1` | Makes winget usable under SYSTEM (fixes `0xC0000135`), including a portable extraction fallback. |
+| `Find-CitrixInstallSource.ps1` | Read-only forensics: identifies **what keeps installing Citrix** and which release track it delivers. Run when a removed client comes back. |
 | `Get-CitrixLaunchDiagnostics.ps1` | Read-only dump of everything that decides whether a published app launches. Run while the affected user is signed in. |
 
 ## Failure modes, and what they look like
@@ -77,7 +78,16 @@ often half-fails (`1603`, `1730`). Cleanup run as SYSTEM while the user is
 signed out never sees their `HKCU`, so the per-user install survives the wipe.
 Run cleanup while the affected user is signed in.
 
-**7. Stores wiped by a clean reinstall.**
+**7. Something re-installs Current Release after you remove it.**
+A client removed cleanly reappears within hours — on `HCDL-9N44WH3`, gone at
+15:17 and back and running by 09:29 next morning as **Citrix Workspace 2603
+(x64)**, i.e. Current Release. Until the installing agent is identified,
+remove-then-install-LTSR is a loop. The likely sources are a management push
+(ConfigMgr / Intune / Workspace ONE), or a user installing from the Citrix or
+Storefront web page — that download **always serves Current Release, never
+LTSR**. → `Find-CitrixInstallSource.ps1`
+
+**8. Stores wiped by a clean reinstall.**
 Everything verifies correctly but users land on "Add Account". Confirm GPO/WS1
 re-pushes the StoreFront URL before relying on `-CleanInstall` or a full wipe.
 
