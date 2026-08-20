@@ -29,6 +29,7 @@ Exit codes across the toolkit: `0` healthy, `1` warnings, `2` action needed,
 | `Repair-IcaAssociation.ps1` | Republishes `.ica` under a non-advertised ProgID to stop MSI self-repair prompting non-admins for credentials. |
 | `Set-CitrixAutoUpdate.ps1` | Pins the Citrix Workspace Updater (default: disabled, stream LTSR). No reinstall needed. |
 | `Repair-Winget.ps1` | Makes winget usable under SYSTEM (fixes `0xC0000135`), including a portable extraction fallback. |
+| `Detect-CitrixWorkspace.ps1` | **WS1/Intune custom detection script.** Detects any build in the LTSR family so a CU does not make a managed install look uninstalled. Exit 0 + STDOUT = detected. |
 | `Find-CitrixInstallSource.ps1` | Read-only forensics: identifies **what keeps installing Citrix** and which release track it delivers. Run when a removed client comes back. |
 | `Get-CitrixLaunchDiagnostics.ps1` | Read-only dump of everything that decides whether a published app launches. Run while the affected user is signed in. |
 
@@ -87,7 +88,15 @@ remove-then-install-LTSR is a loop. The likely sources are a management push
 Storefront web page — that download **always serves Current Release, never
 LTSR**. → `Find-CitrixInstallSource.ps1`
 
-**8. Stores wiped by a clean reinstall.**
+**8. WS1 shows "Install" on a machine that already has Citrix.**
+An app the management agent cannot detect is an app it cannot manage: it never
+reports installed, keeps re-offering, and will not service the endpoint. CWA is
+installed by a *bootstrapper*, so auto-generated detection often keys off a
+ProductCode that is never registered, or off a component MSI whose GUID changes
+every cumulative update. WS1 also needs **exit 0 AND non-empty STDOUT** — exit 0
+alone reads as not detected. → `Detect-CitrixWorkspace.ps1`
+
+**9. Stores wiped by a clean reinstall.**
 Everything verifies correctly but users land on "Add Account". Confirm GPO/WS1
 re-pushes the StoreFront URL before relying on `-CleanInstall` or a full wipe.
 

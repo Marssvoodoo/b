@@ -90,8 +90,12 @@
 
 .NOTES
     Author  : MEB -- Oak Street Health / CVS Health IT Operations
-    Version : 1.2.0
+    Version : 1.3.0
     Date    : 2026-08-20
+    v1.3.0  : When a direct runtime download is blocked (seen on HCDL-B14YRW3:
+              three TLS failures against aka.ms while winget worked fine), fall
+              back to installing the runtime via winget instead of leaving the
+              machine broken.
     v1.2.0  : -Fix can now install CWA itself (-InstallerPath / payload beside
               the script / winget Citrix.Workspace.LTSR), so a standalone
               deployment is no longer left unable to install. Reinstall-
@@ -114,7 +118,7 @@ param(
     [switch]$Quiet
 )
 
-$ScriptVersion     = '1.2.0'
+$ScriptVersion     = '1.3.0'
 $DestinationFolder = 'C:\drop\citrix'
 $LogRetainDays     = 30
 
@@ -601,6 +605,37 @@ function Remove-OrphanedMsiRegistration {
     return $removed
 }
 
+function Install-PrereqViaWinget {
+    # Fallback when the direct download is blocked. winget uses its own
+    # transport and its own source, so it frequently succeeds on networks where
+    # a raw HTTPS GET to aka.ms is intercepted or refused.
+    param([Parameter(Mandatory)][string]$Id, [Parameter(Mandatory)][string]$Name)
+    $wg = Get-Command winget.exe -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source -ErrorAction SilentlyContinue
+    if (-not $wg) {
+        $wg = Get-ChildItem -LiteralPath (Join-Path $env:ProgramFiles 'WindowsApps') -Filter 'Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe' -Directory -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending | ForEach-Object { Join-Path $_.FullName 'winget.exe' } |
+            Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+    }
+    $portable = Join-Path $DestinationFolder 'winget-portable\winget.exe'
+    if (-not $wg -and (Test-Path -LiteralPath $portable)) { $wg = $portable }
+    if (-not $wg) { Write-Log '    winget not available for fallback.' 'WARNING'; return $false }
+
+    $wgArgs = "install --exact --id $Id --silent --force --accept-package-agreements --accept-source-agreements --disable-interactivity"
+    Write-Log "    falling back to winget: $Id" 'WARNING'
+    try {
+        $p = Start-Process -FilePath $wg -ArgumentList $wgArgs -WorkingDirectory (Split-Path -Path $wg -Parent) `
+             -PassThru -WindowStyle Hidden -ErrorAction Stop
+        $null = $p.Handle
+        if (-not $p.WaitForExit(900000)) {
+            & taskkill.exe /PID $p.Id /T /F 2>&1 | Out-Null
+            Write-Log '    winget fallback timed out.' 'ERROR'; return $false
+        }
+    } catch { Write-Log "    winget fallback could not start: $($_.Exception.Message)" 'ERROR'; return $false }
+    if ($p.ExitCode -eq 0) { Write-Log "    winget installed $Name."; return $true }
+    Write-Log "    winget fallback returned $($p.ExitCode) for $Id." 'WARNING'
+    return $false
+}
+
 function Repair-RuntimePrereq {
     # Install/repair VC++ and .NET; clear an orphaned registration first when
     # the MSI cache check found one, since nothing else can succeed until then.
@@ -609,25 +644,29 @@ function Repair-RuntimePrereq {
     if (-not (Test-Path -LiteralPath $work)) { New-Item -Path $work -ItemType Directory -Force | Out-Null }
 
     $pkgs = @(
-        @{ Name='VC++ x86'; Url='https://aka.ms/vs/17/release/vc_redist.x86.exe'; File='vc_redist.x86.exe'; Orphan='Microsoft Visual C++ * X86 *Runtime*' }
-        @{ Name='VC++ x64'; Url='https://aka.ms/vs/17/release/vc_redist.x64.exe'; File='vc_redist.x64.exe'; Orphan='Microsoft Visual C++ * X64 *Runtime*' }
-        @{ Name='.NET Desktop 8 x86'; Url='https://aka.ms/dotnet/8.0/windowsdesktop-runtime-win-x86.exe'; File='ndp-x86.exe'; Orphan=$null }
-        @{ Name='.NET Desktop 8 x64'; Url='https://aka.ms/dotnet/8.0/windowsdesktop-runtime-win-x64.exe'; File='ndp-x64.exe'; Orphan=$null }
+        @{ Name='VC++ x86'; Kind='vcx86'; Url='https://aka.ms/vs/17/release/vc_redist.x86.exe'; File='vc_redist.x86.exe'; Orphan='Microsoft Visual C++ * X86 *Runtime*'; WingetId='Microsoft.VCRedist.2015+.x86' }
+        @{ Name='VC++ x64'; Kind='vcx64'; Url='https://aka.ms/vs/17/release/vc_redist.x64.exe'; File='vc_redist.x64.exe'; Orphan='Microsoft Visual C++ * X64 *Runtime*'; WingetId='Microsoft.VCRedist.2015+.x64' }
+        @{ Name='.NET Desktop 8 x86'; Kind='netx86'; Url='https://aka.ms/dotnet/8.0/windowsdesktop-runtime-win-x86.exe'; File='ndp-x86.exe'; Orphan=$null; WingetId='Microsoft.DotNet.DesktopRuntime.8' }
+        @{ Name='.NET Desktop 8 x64'; Kind='netx64'; Url='https://aka.ms/dotnet/8.0/windowsdesktop-runtime-win-x64.exe'; File='ndp-x64.exe'; Orphan=$null; WingetId='Microsoft.DotNet.DesktopRuntime.8' }
     )
     $reboot = $false
     foreach ($pkg in $pkgs) {
         # Only touch what is actually failing.
-        $needed = switch -Wildcard ($pkg.Name) {
-            'VC++ x86*'          { -not (Test-RuntimeOk -Kind 'vcx86') }
-            'VC++ x64*'          { -not (Test-RuntimeOk -Kind 'vcx64') }
-            '.NET Desktop 8 x86' { -not (Test-RuntimeOk -Kind 'netx86') }
-            '.NET Desktop 8 x64' { -not (Test-RuntimeOk -Kind 'netx64') }
-        }
+        $needed = -not (Test-RuntimeOk -Kind $pkg.Kind)
         if (-not $needed) { continue }
         Write-Log "  Repairing $($pkg.Name)" 'WARNING'
         if ($OrphanFound -and $pkg.Orphan) { Remove-OrphanedMsiRegistration -NamePattern $pkg.Orphan | Out-Null }
         $target = Join-Path $work $pkg.File
-        if (-not (Invoke-Download -Url $pkg.Url -OutFile $target)) { continue }
+        if (-not (Invoke-Download -Url $pkg.Url -OutFile $target)) {
+            # Direct download can fail on locked-down networks (TLS interception,
+            # aka.ms blocked) even where winget works, since winget uses its own
+            # transport. Fall back to it rather than giving up on the runtime.
+            if ($pkg.WingetId -and (Install-PrereqViaWinget -Id $pkg.WingetId -Name $pkg.Name)) {
+                if (Test-RuntimeOk -Kind $pkg.Kind) { Write-Log "    $($pkg.Name): resolved via winget."; continue }
+                Write-Log "    $($pkg.Name): winget install ran but the runtime is still below minimum." 'ERROR'
+            }
+            continue
+        }
         $logFile = Join-Path $work ("{0}.log" -f ($pkg.File -replace '\.exe$',''))
         try {
             $p = Start-Process -FilePath $target -ArgumentList '/install','/quiet','/norestart','/log',"`"$logFile`"" -PassThru -Wait -ErrorAction Stop
