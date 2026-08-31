@@ -59,6 +59,14 @@ logs nothing; the only evidence is Application event 1000. **Judge the DLL on
 disk, not the redist registry key** — they disagree in the field, and the loader
 binds the DLL. → `Install-CitrixPrerequisites.ps1`
 
+Two variants crash the same way while `msvcp140.dll` itself reads as current,
+so check both before concluding the runtime is fine: a **split redist**, where
+`msvcp140.dll` was updated but a sibling such as `vcruntime140.dll` was not
+(they normally all carry one version), and an **app-local copy** of a runtime
+DLL sitting next to the exe, which the loader prefers over the system one. Event
+1000 records the faulting module's full **path** and **version** — read those,
+not just the module name, or you cannot tell the two apart.
+
 **4. Orphaned MSI registration (System Error 1612).**
 A product registered with `LocalPackage` pointing at a file no longer in
 `C:\Windows\Installer` cannot be repaired, upgraded **or** uninstalled — every

@@ -97,8 +97,24 @@
 
 .NOTES
     Author  : MEB -- Oak Street Health / CVS Health IT Operations
-    Version : 1.7.0
+    Version : 1.8.0
     Date    : 2026-08-31
+    v1.8.0  : Crash reporting told a machine to fix something this same run had
+              just measured as healthy. HCDL-B14YRW3 passed every runtime check
+              (VC++ x86 14.44.35211.0, .NET 8.0.30) and was still told "crashes
+              in the VC++ runtime mean it is below CWA minimum". Four changes:
+              (a) the remedy now depends on whether the runtime checks passed
+                  and where the module loaded from, not on its name alone;
+              (b) crash lines log the faulting module's PATH and VERSION, which
+                  is what distinguishes the system DLL from a private copy;
+              (c) the VC++ check reads the whole redist as a SET -- msvcp140.dll
+                  can be current while vcruntime140.dll is not, and a process
+                  then faults inside MSVCP140 with nothing looking wrong;
+              (d) app-local runtime copies are searched across the whole Citrix
+                  tree, not just ICA Client, since SelfServicePlugin and the
+                  other exe folders each get their own loader search path.
+              A crash whose remedy -Fix cannot act on no longer claims a fix
+              category, so "applying fixes" stops appearing where nothing runs.
     v1.7.0  : Added -WebLaunchOnly. Where users launch from the StoreFront web
               page and the Workspace app only executes the downloaded .ica, an
               unconfigured store is correct, not a defect -- warning about it
@@ -150,7 +166,7 @@ param(
     [switch]$Quiet
 )
 
-$ScriptVersion     = '1.7.0'
+$ScriptVersion     = '1.8.0'
 $DestinationFolder = 'C:\drop\citrix'
 $LogRetainDays     = 30
 
@@ -292,9 +308,35 @@ function Test-CitrixBinaries {
     }
 }
 
+# Every DLL the VC++ redistributable installs as one unit. They are always
+# stamped with the same version, so a set where they DISAGREE means something
+# replaced part of it -- and a process can then access-violate inside
+# MSVCP140.dll while msvcp140.dll itself reads as a perfectly current version.
+# Checking msvcp140.dll alone cannot see that.
+$script:VCRuntimeSet = @(
+    'msvcp140.dll', 'msvcp140_1.dll', 'msvcp140_2.dll', 'msvcp140_atomic_wait.dll',
+    'msvcp140_codecvt_ids.dll', 'vcruntime140.dll', 'vcruntime140_1.dll', 'concrt140.dll'
+)
+
+function Get-VCRuntimeSetState {
+    # Versions of every member of the set that is actually present in $Dir.
+    # Members legitimately absent on older redists (msvcp140_atomic_wait.dll
+    # arrived in 14.28, vcruntime140_1.dll is x64-only) are skipped, not failed.
+    param([Parameter(Mandatory)][string]$Dir)
+    $out = @()
+    foreach ($n in $script:VCRuntimeSet) {
+        $p = Join-Path $Dir $n
+        if (-not (Test-Path -LiteralPath $p)) { continue }
+        $v = ConvertTo-VersionOrNull (Get-Item -LiteralPath $p).VersionInfo.FileVersion
+        if ($v) { $out += [pscustomobject]@{ Name = $n; Version = $v; Path = $p } }
+    }
+    return $out
+}
+
 function Test-VCRuntime {
     foreach ($a in @(@{n='x86'; dir='SysWOW64'}, @{n='x64'; dir='System32'})) {
-        $dllPath = Join-Path (Join-Path $env:SystemRoot $a.dir) 'msvcp140.dll'
+        $archDir = Join-Path $env:SystemRoot $a.dir
+        $dllPath = Join-Path $archDir 'msvcp140.dll'
         $dll = if (Test-Path -LiteralPath $dllPath) { ConvertTo-VersionOrNull (Get-Item -LiteralPath $dllPath).VersionInfo.FileVersion } else { $null }
         $regPath = if ($a.n -eq 'x64') { 'HKLM:\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64' }
                    else { 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\VisualStudio\14.0\VC\Runtimes\x86' }
@@ -310,6 +352,27 @@ function Test-VCRuntime {
             Add-Result "VC++ $($a.n) runtime" 'WARN' "on-disk $dll meets minimum but registry claims $reg" ''
         } else {
             Add-Result "VC++ $($a.n) runtime" 'PASS' "$dll"
+        }
+
+        # msvcp140.dll can be current while the rest of the redist is not. That
+        # set is what the loader actually binds, so check it as a set.
+        if ($dll) {
+            $set   = @(Get-VCRuntimeSetState -Dir $archDir)
+            $stale = @($set | Where-Object { $_.Version -lt $MinVCRedist })
+            $spread = @($set | Select-Object -ExpandProperty Version -Unique)
+            if ($stale) {
+                Add-Result "VC++ $($a.n) set consistency" 'FAIL' `
+                    ("{0} below minimum $MinVCRedist while msvcp140.dll is $dll -- a split redist crashes inside MSVCP140 even though msvcp140.dll looks current" -f `
+                        (($stale | ForEach-Object { "$($_.Name)=$($_.Version)" }) -join ', ')) `
+                    'Install-CitrixPrerequisites.ps1 -ForceReinstall (reinstalls the whole redist, not just the one DLL)' 'prereq'
+            } elseif ($spread.Count -gt 1) {
+                Add-Result "VC++ $($a.n) set consistency" 'WARN' `
+                    ("{0} versions present, all at or above minimum: {1}" -f $spread.Count, `
+                        (($set | ForEach-Object { "$($_.Name)=$($_.Version)" }) -join ', ')) `
+                    'Not necessarily a fault, but the redist normally stamps every file the same -- reinstall it if Citrix crashes in one of these modules'
+            } else {
+                Add-Result "VC++ $($a.n) set consistency" 'PASS' ("{0} file(s), all $($spread[0])" -f $set.Count)
+            }
         }
     }
 }
@@ -388,24 +451,45 @@ function Test-MsiCacheIntegrity {
     }
 }
 
+function Get-AppLocalRuntimeCopy {
+    # Search the WHOLE Citrix tree, not just ICA Client. The loader prefers a
+    # DLL sitting next to the .exe over the system one, so a copy in any
+    # subfolder that holds an executable -- SelfServicePlugin, Receiver,
+    # Authentication -- silently outranks a repaired system runtime for the
+    # process that lives there. Looking in one directory misses those.
+    $out = @()
+    foreach ($root in (Get-CitrixRoots)) {
+        if (-not (Test-Path -LiteralPath $root)) { continue }
+        $out += Get-ChildItem -LiteralPath $root -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $script:VCRuntimeSet -contains $_.Name } |
+            ForEach-Object {
+                [pscustomobject]@{
+                    Name = $_.Name; Path = $_.FullName
+                    Version = (ConvertTo-VersionOrNull $_.VersionInfo.FileVersion)
+                }
+            }
+    }
+    return $out
+}
+
 function Test-AppLocalShim {
-    $ica = Get-CitrixRoots | ForEach-Object { Join-Path $_ 'ICA Client' } |
-        Where-Object { Test-Path -LiteralPath (Join-Path $_ 'wfcrun32.exe') } | Select-Object -First 1
-    if (-not $ica) { return }
-    $shim = Join-Path $ica 'msvcp140.dll'
-    if (-not (Test-Path -LiteralPath $shim)) {
-        Add-Result 'App-local runtime shim' 'PASS' 'not present (Citrix uses the system runtime)'
+    $copies = @(Get-AppLocalRuntimeCopy)
+    if (-not $copies) {
+        Add-Result 'App-local runtime shim' 'PASS' 'none anywhere under the Citrix tree (Citrix uses the system runtime)'
         return
     }
-    $shimV = ConvertTo-VersionOrNull (Get-Item -LiteralPath $shim).VersionInfo.FileVersion
-    $sysP  = Join-Path (Join-Path $env:SystemRoot 'SysWOW64') 'msvcp140.dll'
-    $sysV  = if (Test-Path -LiteralPath $sysP) { ConvertTo-VersionOrNull (Get-Item -LiteralPath $sysP).VersionInfo.FileVersion } else { $null }
-    if ($sysV -and $sysV -ge $MinVCRedist -and $shimV -and $shimV -lt $sysV) {
+    $sysP = Join-Path (Join-Path $env:SystemRoot 'SysWOW64') 'msvcp140.dll'
+    $sysV = if (Test-Path -LiteralPath $sysP) { ConvertTo-VersionOrNull (Get-Item -LiteralPath $sysP).VersionInfo.FileVersion } else { $null }
+    $stale = @($copies | Where-Object { $sysV -and $_.Version -and $_.Version -lt $sysV })
+    $detail = ($copies | ForEach-Object { "$($_.Path)=$($_.Version)" }) -join '; '
+
+    if ($sysV -and $sysV -ge $MinVCRedist -and $stale) {
         Add-Result 'App-local runtime shim' 'WARN' `
-            "shim v$shimV in ICA Client is now OLDER than the system runtime v$sysV, and app-local copies are never serviced" `
-            "delete msvcp140.dll and vcruntime140.dll from $ica, then re-test the launch" 'shim'
+            ("{0} app-local copy(ies) OLDER than the system runtime v{1} -- these win over the repaired system DLL and are never serviced: {2}" -f `
+                $stale.Count, $sysV, (($stale | ForEach-Object { "$($_.Path)=$($_.Version)" }) -join '; ')) `
+            'Delete them and re-test the launch (-Fix does this)' 'shim'
     } else {
-        Add-Result 'App-local runtime shim' 'INFO' "present v$shimV (system v$sysV) -- intentional workaround"
+        Add-Result 'App-local runtime shim' 'INFO' "present (system v$sysV): $detail -- intentional workaround"
     }
 }
 
@@ -544,6 +628,38 @@ function Test-ConfiguredStores {
     }
 }
 
+function Get-CrashDetail {
+    # Application Error (event 1000) publishes its fields as ordered properties:
+    #   0 app name, 1 app version, 3 module name, 4 module version,
+    #   6 exception code, 10 app path, 11 module path.
+    # Read those rather than the rendered message: the "Faulting module name:"
+    # labels are localised, so message parsing quietly returns nothing on a
+    # non-English Windows. The message regex stays as a fallback.
+    # Named $Record, not $Event: $Event is a PowerShell automatic variable.
+    param([Parameter(Mandatory)]$Record)
+
+    $d = [ordered]@{
+        Time = $Record.TimeCreated; App = ''; AppVersion = ''; Module = ''
+        ModuleVersion = ''; Code = ''; ModulePath = ''
+    }
+    $p = @()
+    try { $p = @($Record.Properties | ForEach-Object { [string]$_.Value }) }
+    catch { $p = @() }   # unreadable properties just fall through to the message
+    if ($p.Count -ge 12) {
+        $d.App = $p[0].Trim(); $d.AppVersion = $p[1].Trim(); $d.Module = $p[3].Trim()
+        $d.ModuleVersion = $p[4].Trim(); $d.Code = $p[6].Trim(); $d.ModulePath = $p[11].Trim()
+    }
+
+    $m = [string]$Record.Message
+    if ($m) {
+        if (-not $d.App        -and $m -match 'Faulting application name:\s*([^,\r\n]+)') { $d.App = $Matches[1].Trim() }
+        if (-not $d.Module     -and $m -match 'Faulting module name:\s*([^,\r\n]+)')      { $d.Module = $Matches[1].Trim() }
+        if (-not $d.ModulePath -and $m -match 'Faulting module path:\s*([^\r\n]+)')       { $d.ModulePath = $Matches[1].Trim() }
+        if (-not $d.Code       -and $m -match 'Exception code:\s*(0x[0-9a-fA-F]+)')       { $d.Code = $Matches[1].Trim() }
+    }
+    return [pscustomobject]$d
+}
+
 function Test-RecentCrashes {
     $since = (Get-Date).AddHours(-$EventHours)
     $events = Get-WinEvent -FilterHashtable @{ LogName='Application'; ProviderName='Application Error'; StartTime=$since } -ErrorAction SilentlyContinue |
@@ -552,16 +668,51 @@ function Test-RecentCrashes {
         Add-Result "Citrix crashes (last ${EventHours}h)" 'PASS' 'none'
         return
     }
-    $mods = ($events | ForEach-Object { if ($_.Message -match 'Faulting module name:\s*([^,]+)') { $Matches[1].Trim() } }) |
-        Sort-Object -Unique
-    foreach ($e in ($events | Select-Object -First 5)) {
-        $app = if ($e.Message -match 'Faulting application name:\s*([^,]+)') { $Matches[1].Trim() } else { '?' }
-        $mod = if ($e.Message -match 'Faulting module name:\s*([^,]+)') { $Matches[1].Trim() } else { '?' }
-        Write-Log ("         {0:HH:mm:ss} {1} faulted in {2}" -f $e.TimeCreated, $app, $mod) 'WARNING'
+    $details = @($events | ForEach-Object { Get-CrashDetail $_ })
+    $mods = @($details | Where-Object { $_.Module } | Select-Object -ExpandProperty Module | Sort-Object -Unique)
+    foreach ($d in ($details | Select-Object -First 5)) {
+        # Log the module's PATH and VERSION, not just its name. "faulted in
+        # MSVCP140.dll" cannot tell you whether the process bound the repaired
+        # system DLL or an old private copy next to the exe -- and those need
+        # opposite fixes. The event already carries both; print them.
+        Write-Log ("         {0:HH:mm:ss} {1} faulted in {2} v{3} {4} [{5}]" -f `
+            $d.Time, ($d.App -replace '^$','?'), ($d.Module -replace '^$','?'), `
+            ($d.ModuleVersion -replace '^$','?'), $d.Code, ($d.ModulePath -replace '^$','path unknown')) 'WARNING'
     }
-    $remedy = if ($mods -match 'MSVCP140|VCRUNTIME140') { 'Install-CitrixPrerequisites.ps1 -- crashes in the VC++ runtime mean it is below CWA minimum' }
-              elseif ($mods -match 'coreclr') { 'Install-CitrixPrerequisites.ps1 -- check the .NET Desktop Runtime' }
-              else { 'Review C:\Program Files (x86)\Citrix\Logs and %TEMP%\CTXWorkspaceInstallLogs' }
+
+    # Where the faulting module actually loaded from decides the remedy.
+    $sysRoot  = $env:SystemRoot.TrimEnd('\')
+    $private  = @($details | Where-Object { $_.ModulePath -and $_.ModulePath -notlike "$sysRoot\*" -and
+                                            $script:VCRuntimeSet -contains $_.Module } |
+                    Select-Object -ExpandProperty ModulePath -Unique)
+    $runtimeOk = (Test-RuntimeOk -Kind 'vcx86') -and (Test-RuntimeOk -Kind 'vcx64')
+
+    $remedy =
+        if ($private) {
+            "The faulting runtime DLL did NOT load from $sysRoot -- it came from $($private -join '; '). A private copy beside the exe outranks the system runtime; remove it (this script's -Fix does) and re-test."
+        }
+        elseif ($mods -match 'MSVCP140|VCRUNTIME140') {
+            if ($runtimeOk) {
+                # Do not repeat the below-minimum diagnosis when this run just
+                # measured the runtime as fine -- that sends whoever reads the
+                # log to reinstall something that is already current.
+                'The system VC++ already meets the minimum, so this is NOT the below-minimum crash. Check the "VC++ set consistency" result above, then run Get-CitrixLaunchDiagnostics.ps1 while the affected user is signed in.'
+            } else {
+                'Install-CitrixPrerequisites.ps1 -- crashes in the VC++ runtime mean it is below CWA minimum'
+            }
+        }
+        elseif ($mods -match 'coreclr') {
+            # coreclr.dll is where a managed exception surfaces, so the fault is
+            # usually an unhandled .NET exception in SelfService, not a bad
+            # runtime. Reinstalling .NET does nothing for it.
+            'coreclr.dll is where an unhandled .NET exception surfaces -- it is usually an application fault in SelfService, not a bad .NET runtime. Check the .NET result above; if it passes, read C:\Program Files (x86)\Citrix\ICA Client\SelfServicePlugin logs and confirm the store SelfService is trying to reach.'
+        }
+        else { 'Review C:\Program Files (x86)\Citrix\Logs and %TEMP%\CTXWorkspaceInstallLogs' }
+
+    # Only claim a category -Fix can actually act on. Sending a machine whose
+    # runtimes all pass through the prereq fix just logs "applying fixes" and
+    # changes nothing, which reads as a repair that silently failed.
+    $category = if ($private) { 'shim' } elseif (-not $runtimeOk) { 'prereq' } else { '' }
 
     # A crash that happened BEFORE the runtime was repaired is history, not a
     # live fault -- but it stays in the event log for the whole lookback window.
@@ -588,7 +739,7 @@ function Test-RecentCrashes {
         return
     }
     Add-Result "Citrix crashes (last ${EventHours}h)" 'FAIL' `
-        ("{0} crash event(s); faulting module(s): {1}" -f $events.Count, ($mods -join ', ')) $remedy 'prereq'
+        ("{0} crash event(s); faulting module(s): {1}" -f $events.Count, ($mods -join ', ')) $remedy $category
 }
 
 function Test-WingetUnderSystem {
@@ -919,16 +1070,25 @@ function Repair-IcaAssociationNative {
 }
 
 function Remove-StaleShim {
-    $ica = Get-CitrixRoots | ForEach-Object { Join-Path $_ 'ICA Client' } |
-        Where-Object { Test-Path -LiteralPath (Join-Path $_ 'wfcrun32.exe') } | Select-Object -First 1
-    if (-not $ica) { return $false }
+    # Remove app-local VC++ runtime copies wherever they sit in the Citrix
+    # tree, so the process falls back to the serviced system runtime. Only
+    # copies OLDER than the system DLL are touched: a copy that is newer is
+    # doing real work, and deleting it would break the app rather than fix it.
+    $sysP = Join-Path (Join-Path $env:SystemRoot 'SysWOW64') 'msvcp140.dll'
+    $sysV = if (Test-Path -LiteralPath $sysP) { ConvertTo-VersionOrNull (Get-Item -LiteralPath $sysP).VersionInfo.FileVersion } else { $null }
+    if (-not $sysV -or $sysV -lt $MinVCRedist) {
+        Write-Log '  system runtime is not healthy enough to fall back to; leaving app-local copies in place.' 'WARNING'
+        return $false
+    }
     $removed = $false
-    foreach ($dll in @('msvcp140.dll','vcruntime140.dll')) {
-        $p = Join-Path $ica $dll
-        if (-not (Test-Path -LiteralPath $p)) { continue }
-        try { Remove-Item -LiteralPath $p -Force -ErrorAction Stop
-              Write-Log "  removed stale app-local shim: $p" 'WARNING'; $removed = $true }
-        catch { Write-Log "  could not remove ${p}: $($_.Exception.Message)" 'WARNING' }
+    foreach ($c in (Get-AppLocalRuntimeCopy)) {
+        if (-not $c.Version -or $c.Version -ge $sysV) {
+            Write-Log "  keeping $($c.Path) (v$($c.Version), not older than system v$sysV)"
+            continue
+        }
+        try { Remove-Item -LiteralPath $c.Path -Force -ErrorAction Stop
+              Write-Log "  removed stale app-local shim: $($c.Path) (v$($c.Version) < system v$sysV)" 'WARNING'; $removed = $true }
+        catch { Write-Log "  could not remove $($c.Path): $($_.Exception.Message)" 'WARNING' }
     }
     return $removed
 }
