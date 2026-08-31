@@ -90,8 +90,15 @@
 
 .NOTES
     Author  : MEB -- Oak Street Health / CVS Health IT Operations
-    Version : 1.3.0
-    Date    : 2026-08-20
+    Version : 1.4.0
+    Date    : 2026-08-21
+    v1.4.0  : HCDL-B14YRW3 passed the MSI cache check and its VC++ install
+              still failed 1612/1714, because a missing cached PATCH fails
+              exactly like a missing cached product. The cache check now scans
+              patches too, and the runtime repair self-escalates on the actual
+              1612 rather than trusting the pre-check: it clears the stale
+              registration and retries. Every runtime repair now verifies the
+              on-disk DLL afterwards instead of trusting the exit code.
     v1.3.0  : When a direct runtime download is blocked (seen on HCDL-B14YRW3:
               three TLS failures against aka.ms while winget worked fine), fall
               back to installing the runtime via winget instead of leaving the
@@ -118,7 +125,7 @@ param(
     [switch]$Quiet
 )
 
-$ScriptVersion     = '1.3.0'
+$ScriptVersion     = '1.4.0'
 $DestinationFolder = 'C:\drop\citrix'
 $LogRetainDays     = 30
 
@@ -314,11 +321,25 @@ function Test-MsiCacheIntegrity {
     foreach ($p in (Get-ChildItem $root -ErrorAction SilentlyContinue)) {
         $ip = Join-Path $p.PSPath 'InstallProperties'
         $props = Get-ItemProperty -LiteralPath $ip -ErrorAction SilentlyContinue
-        if (-not $props -or -not $props.LocalPackage) { continue }
-        if (-not (Test-Path -LiteralPath $props.LocalPackage)) {
+        if ($props -and $props.LocalPackage -and -not (Test-Path -LiteralPath $props.LocalPackage)) {
             $broken += [pscustomobject]@{
                 Name = $(if ($props.DisplayName) { $props.DisplayName } else { $p.PSChildName })
                 Package = $props.LocalPackage
+            }
+        }
+        # A missing cached PATCH fails identically to a missing cached product:
+        # RemoveExistingProducts cannot run, and the install dies 1612/1714.
+        # HCDL-B14YRW3 passed the product scan and still failed this way, so the
+        # patch cache has to be checked as well.
+        $patchRoot = Join-Path $p.PSPath 'Patches'
+        foreach ($patch in (Get-ChildItem -LiteralPath $patchRoot -ErrorAction SilentlyContinue)) {
+            $pp = Get-ItemProperty -LiteralPath $patch.PSPath -ErrorAction SilentlyContinue
+            if ($pp -and $pp.LocalPackage -and -not (Test-Path -LiteralPath $pp.LocalPackage)) {
+                $owner = $(if ($props -and $props.DisplayName) { $props.DisplayName } else { $p.PSChildName })
+                $broken += [pscustomobject]@{
+                    Name = "$owner (patch $($patch.PSChildName))"
+                    Package = $pp.LocalPackage
+                }
             }
         }
     }
@@ -668,21 +689,81 @@ function Repair-RuntimePrereq {
             continue
         }
         $logFile = Join-Path $work ("{0}.log" -f ($pkg.File -replace '\.exe$',''))
-        try {
-            $p = Start-Process -FilePath $target -ArgumentList '/install','/quiet','/norestart','/log',"`"$logFile`"" -PassThru -Wait -ErrorAction Stop
-            switch ($p.ExitCode) {
-                0    { Write-Log "    $($pkg.Name): installed." }
-                3010 { Write-Log "    $($pkg.Name): installed, reboot required." 'WARNING'; $reboot = $true }
-                default {
-                    Write-Log "    $($pkg.Name): installer returned $($p.ExitCode)" 'ERROR'
-                    Select-String -LiteralPath (Get-ChildItem -LiteralPath $work -Filter "$([IO.Path]::GetFileNameWithoutExtension($logFile))*.log" -ErrorAction SilentlyContinue | ForEach-Object FullName) `
-                        -Pattern 'Error \d+|System Error \d+|return value 3' -ErrorAction SilentlyContinue |
-                        Select-Object -Last 4 | ForEach-Object { Write-Log ("      {0}" -f $_.Line.Trim()) 'WARNING' }
+        $code = Invoke-PrereqInstaller -Installer $target -LogFile $logFile -Name $pkg.Name
+        switch ($code) {
+            0    { Write-Log "    $($pkg.Name): installed." }
+            3010 { Write-Log "    $($pkg.Name): installed, reboot required." 'WARNING'; $reboot = $true }
+            default {
+                Write-Log "    $($pkg.Name): installer returned $code" 'ERROR'
+                Write-PrereqLogErrors -Work $work -LogFile $logFile
+                # Self-escalate on ERROR_INSTALL_SOURCE_ABSENT. The cached
+                # package (or a cached patch) is gone, so RemoveExistingProducts
+                # can never succeed and no retry of the same install will help.
+                # This is deliberately driven by the ACTUAL error rather than by
+                # the MSI-cache pre-check: on HCDL-B14YRW3 that check passed and
+                # the install still failed 1612, because a missing cached PATCH
+                # produces the same failure as a missing cached product.
+                if ($pkg.Orphan -and (Test-MsiSourceAbsent -Work $work -LogFile $logFile)) {
+                    Write-Log "    $($pkg.Name): MSI reports the cached source is absent (1612/1714)." 'ERROR'
+                    Write-Log "    Escalating: clearing the stale registration, then retrying the install." 'WARNING'
+                    if (Remove-OrphanedMsiRegistration -NamePattern $pkg.Orphan) {
+                        $retryLog = Join-Path $work ("{0}-retry.log" -f ($pkg.File -replace '\.exe$',''))
+                        $code2 = Invoke-PrereqInstaller -Installer $target -LogFile $retryLog -Name $pkg.Name
+                        switch ($code2) {
+                            0    { Write-Log "    $($pkg.Name): installed after clearing the stale registration." }
+                            3010 { Write-Log "    $($pkg.Name): installed after clearing; reboot required." 'WARNING'; $reboot = $true }
+                            default {
+                                Write-Log "    $($pkg.Name): still failing after escalation (exit $code2)." 'ERROR'
+                                Write-PrereqLogErrors -Work $work -LogFile $retryLog
+                            }
+                        }
+                    } else {
+                        Write-Log "    Nothing could be cleared; the runtime remains below minimum." 'ERROR'
+                    }
                 }
             }
-        } catch { Write-Log "    could not launch $($pkg.Name) installer: $($_.Exception.Message)" 'ERROR' }
+        }
+        if (Test-RuntimeOk -Kind $pkg.Kind) { Write-Log "    $($pkg.Name): verified on disk." }
+        else { Write-Log "    $($pkg.Name): STILL below minimum on disk." 'ERROR' }
     }
     return $reboot
+}
+
+function Invoke-PrereqInstaller {
+    param([Parameter(Mandatory)][string]$Installer, [Parameter(Mandatory)][string]$LogFile, [Parameter(Mandatory)][string]$Name)
+    try {
+        $p = Start-Process -FilePath $Installer -ArgumentList '/install','/quiet','/norestart','/log',"`"$LogFile`"" -PassThru -Wait -ErrorAction Stop
+        return $p.ExitCode
+    } catch {
+        Write-Log "    could not launch $Name installer: $($_.Exception.Message)" 'ERROR'
+        return -1
+    }
+}
+
+function Get-PrereqLogFiles {
+    # Burn writes sibling MSI logs alongside the bundle log it was given.
+    param([Parameter(Mandatory)][string]$Work, [Parameter(Mandatory)][string]$LogFile)
+    Get-ChildItem -LiteralPath $Work -Filter "$([IO.Path]::GetFileNameWithoutExtension($LogFile))*.log" -ErrorAction SilentlyContinue |
+        ForEach-Object { $_.FullName }
+}
+
+function Write-PrereqLogErrors {
+    param([Parameter(Mandatory)][string]$Work, [Parameter(Mandatory)][string]$LogFile)
+    $files = @(Get-PrereqLogFiles -Work $Work -LogFile $LogFile)
+    if (-not $files) { return }
+    Select-String -LiteralPath $files -Pattern 'Error \d+|System Error \d+|return value 3|Failed to resolve source' -ErrorAction SilentlyContinue |
+        Select-Object -Last 4 | ForEach-Object { Write-Log ("      {0}" -f $_.Line.Trim()) 'WARNING' }
+}
+
+function Test-MsiSourceAbsent {
+    # System Error 1612 = ERROR_INSTALL_SOURCE_ABSENT; 1714 is the
+    # "older version cannot be removed" that it surfaces as.
+    param([Parameter(Mandatory)][string]$Work, [Parameter(Mandatory)][string]$LogFile)
+    $files = @(Get-PrereqLogFiles -Work $Work -LogFile $LogFile)
+    if (-not $files) { return $false }
+    $hit = Select-String -LiteralPath $files -Pattern 'System Error 1612|Error 1714|SOURCEMGMT: Failed to resolve source' -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    return [bool]$hit
 }
 
 function Test-RuntimeOk {
