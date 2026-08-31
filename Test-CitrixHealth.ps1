@@ -90,8 +90,15 @@
 
 .NOTES
     Author  : MEB -- Oak Street Health / CVS Health IT Operations
-    Version : 1.4.0
+    Version : 1.5.0
     Date    : 2026-08-21
+    v1.5.0  : Grade the per-user .ica UserChoice by WHAT it points at. One
+              pointing at the repaired ProgID is fine; one pointing at the
+              advertised ProgID is a FAIL, because it outranks the machine
+              setting and that user still gets the "modified only by an
+              administrator" dialog on every .ica open. Windows recreates it
+              whenever the user answers an "Open with" prompt, so it returns
+              after a machine-level fix.
     v1.4.0  : HCDL-B14YRW3 passed the MSI cache check and its VC++ install
               still failed 1612/1714, because a missing cached PATCH fails
               exactly like a missing cached product. The cache check now scans
@@ -125,7 +132,7 @@ param(
     [switch]$Quiet
 )
 
-$ScriptVersion     = '1.4.0'
+$ScriptVersion     = '1.5.0'
 $DestinationFolder = 'C:\drop\citrix'
 $LogRetainDays     = 30
 
@@ -419,9 +426,21 @@ function Test-IcaAssociation {
         }
         $uc = "Registry::HKEY_USERS\$sid\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\.ica\UserChoice"
         if (Test-Path -LiteralPath $uc) {
-            Add-Result '.ica UserChoice override' 'WARN' `
-                "$sid -> $((Get-ItemProperty -LiteralPath $uc -ErrorAction SilentlyContinue).ProgId)" `
-                'Repair-IcaAssociation.ps1' 'ica'
+            $ucProg = (Get-ItemProperty -LiteralPath $uc -ErrorAction SilentlyContinue).ProgId
+            # A UserChoice pointing at the REPAIRED ProgID is harmless -- it just
+            # pins the user to the fix. One pointing at the advertised ProgID is
+            # the actual fault: it outranks the machine default, so that user
+            # still triggers Installer self-repair and gets the Citrix
+            # "can be modified only by an administrator" dialog on every launch.
+            # Windows recreates it whenever the user picks an app from an
+            # "Open with" prompt, so it can come back after a machine-level fix.
+            if ($ucProg -and $ucProg -notmatch '\.NEW$') {
+                Add-Result '.ica UserChoice override' 'FAIL' `
+                    "$sid -> '$ucProg' is the advertised ProgID and outranks the machine setting; this user gets the admin-credentials dialog when opening a .ica" `
+                    'Repair-IcaAssociation.ps1 (then that user must sign out and back in)' 'ica'
+            } else {
+                Add-Result '.ica UserChoice override' 'PASS' "$sid -> $ucProg (repaired ProgID)"
+            }
         }
     }
 }
