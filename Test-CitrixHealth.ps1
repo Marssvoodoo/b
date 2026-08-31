@@ -82,6 +82,13 @@
     Citrix.Workspace.LTSR -- the LTSR manifest. Do NOT point this at
     Citrix.Workspace, which is the Current Release track.
 
+.PARAMETER WebLaunchOnly
+    Treat an unconfigured store as expected rather than a warning. Set this
+    when users launch published apps from the StoreFront/Epic web page and the
+    Workspace app only runs the downloaded .ica -- in that model no store is
+    ever configured, and the launch path depends on the .ica association and
+    the receiver:// handler, both of which are checked separately.
+
 .PARAMETER EventHours
     How far back to look for crash events. Default 24.
 
@@ -90,8 +97,12 @@
 
 .NOTES
     Author  : MEB -- Oak Street Health / CVS Health IT Operations
-    Version : 1.6.0
+    Version : 1.7.0
     Date    : 2026-08-31
+    v1.7.0  : Added -WebLaunchOnly. Where users launch from the StoreFront web
+              page and the Workspace app only executes the downloaded .ica, an
+              unconfigured store is correct, not a defect -- warning about it
+              on every run is noise that hides real findings.
     v1.6.0  : Do not report a repaired machine as failing on historical
               crashes. HCDL-B14YRW3 was fixed at 11:54 and still reported FAIL
               afterwards, because every crash in the 24h lookback predated the
@@ -135,10 +146,11 @@ param(
     [string]$InstallerPath = '',
     [string]$WingetId = 'Citrix.Workspace.LTSR',
     [int]$EventHours = 24,
+    [switch]$WebLaunchOnly,
     [switch]$Quiet
 )
 
-$ScriptVersion     = '1.6.0'
+$ScriptVersion     = '1.7.0'
 $DestinationFolder = 'C:\drop\citrix'
 $LogRetainDays     = 30
 
@@ -518,9 +530,17 @@ function Test-ConfiguredStores {
         }
     }
     if ($stores) { Add-Result 'Configured stores' 'PASS' ("{0} store entr(ies)" -f $stores.Count) }
+    elseif ($WebLaunchOnly) {
+        # Deliberately unconfigured: users launch from the StoreFront/Epic web
+        # page and the Workspace app only executes the downloaded .ica. In that
+        # model no store is needed, so flagging it every run is noise. The
+        # things that DO matter for web launch -- the .ica association and the
+        # receiver:// handler -- are checked separately above.
+        Add-Result 'Configured stores' 'INFO' 'none, and none expected (-WebLaunchOnly): users launch from the web portal'
+    }
     else {
         Add-Result 'Configured stores' 'WARN' 'no store configured at machine or user level -- users will land on "Add Account"' `
-            'Confirm GPO/WS1 re-pushes the StoreFront URL (a clean reinstall wipes stores)'
+            'Confirm GPO/WS1 re-pushes the StoreFront URL, or pass -WebLaunchOnly if users launch from the web portal instead'
     }
 }
 
