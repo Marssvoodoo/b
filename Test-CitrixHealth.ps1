@@ -97,8 +97,26 @@
 
 .NOTES
     Author  : MEB -- Oak Street Health / CVS Health IT Operations
-    Version : 1.8.0
+    Version : 1.9.0
     Date    : 2026-08-31
+    v1.9.0  : Decide "already repaired" from the crash event, not a timestamp.
+              HCDL-B14YRW3 kept reporting FAIL after a successful repair: the
+              12:45 run showed wfcrun32.exe had faulted at 11:54 in MSVCP140.dll
+              v14.22.27821.0 while that same path now holds v14.44.35211.0 --
+              provably a pre-repair crash, still called live. The old rule
+              compared the crash time against the DLL's LastWriteTime, and
+              installers preserve a file's original build timestamp, so the
+              repaired runtime carried a write time older than the crash.
+              Now: if every copy of the faulting module on disk is newer than
+              the version the event recorded, the crash cannot recur as logged
+              and is reported historical -- and that also dates the repair, so
+              earlier collateral faults (SelfService in coreclr.dll, which
+              links against the same VC++ redist) are covered by it.
+              Also: app-local runtime copies are only called shadowing when an
+              executable shares their directory. CWA leaves redist payload in
+              its bootstrapper folders (Citrix Workspace 2507, Ctx-{GUID})
+              where nothing loads it; v1.8.0 called those a shim and deleted
+              them, which was harmless but not a fix and not accurate.
     v1.8.0  : Crash reporting told a machine to fix something this same run had
               just measured as healthy. HCDL-B14YRW3 passed every runtime check
               (VC++ x86 14.44.35211.0, .NET 8.0.30) and was still told "crashes
@@ -166,7 +184,7 @@ param(
     [switch]$Quiet
 )
 
-$ScriptVersion     = '1.8.0'
+$ScriptVersion     = '1.9.0'
 $DestinationFolder = 'C:\drop\citrix'
 $LogRetainDays     = 30
 
@@ -463,9 +481,18 @@ function Get-AppLocalRuntimeCopy {
         $out += Get-ChildItem -LiteralPath $root -Recurse -File -ErrorAction SilentlyContinue |
             Where-Object { $script:VCRuntimeSet -contains $_.Name } |
             ForEach-Object {
+                # A DLL only outranks the system copy for an executable in its
+                # OWN directory. CWA leaves the redist payload behind in its
+                # bootstrapper folders (Citrix Workspace 2507, Ctx-{GUID}),
+                # where nothing loads it -- calling those a shim that shadows
+                # the system runtime is simply wrong.
+                $dir = $_.DirectoryName
+                $exe = @(Get-ChildItem -LiteralPath $dir -Filter '*.exe' -File -ErrorAction SilentlyContinue |
+                            Select-Object -ExpandProperty Name)
                 [pscustomobject]@{
                     Name = $_.Name; Path = $_.FullName
                     Version = (ConvertTo-VersionOrNull $_.VersionInfo.FileVersion)
+                    Exes = $exe
                 }
             }
     }
@@ -481,15 +508,25 @@ function Test-AppLocalShim {
     $sysP = Join-Path (Join-Path $env:SystemRoot 'SysWOW64') 'msvcp140.dll'
     $sysV = if (Test-Path -LiteralPath $sysP) { ConvertTo-VersionOrNull (Get-Item -LiteralPath $sysP).VersionInfo.FileVersion } else { $null }
     $stale = @($copies | Where-Object { $sysV -and $_.Version -and $_.Version -lt $sysV })
-    $detail = ($copies | ForEach-Object { "$($_.Path)=$($_.Version)" }) -join '; '
+    # Only a copy sharing a directory with an executable can shadow the system
+    # runtime for that process. The rest are install leftovers.
+    $shadowing = @($stale | Where-Object { $_.Exes.Count -gt 0 })
+    $inert     = @($stale | Where-Object { $_.Exes.Count -eq 0 })
 
-    if ($sysV -and $sysV -ge $MinVCRedist -and $stale) {
+    if ($sysV -and $sysV -ge $MinVCRedist -and $shadowing) {
         Add-Result 'App-local runtime shim' 'WARN' `
-            ("{0} app-local copy(ies) OLDER than the system runtime v{1} -- these win over the repaired system DLL and are never serviced: {2}" -f `
-                $stale.Count, $sysV, (($stale | ForEach-Object { "$($_.Path)=$($_.Version)" }) -join '; ')) `
+            ("{0} copy(ies) older than the system runtime v{1} sit beside an executable and outrank it there, and are never serviced: {2}" -f `
+                $shadowing.Count, $sysV, `
+                (($shadowing | ForEach-Object { "$($_.Path)=$($_.Version) [loads for: $(($_.Exes | Select-Object -First 3) -join ', ')]" }) -join '; ')) `
             'Delete them and re-test the launch (-Fix does this)' 'shim'
+    } elseif ($inert) {
+        Add-Result 'App-local runtime shim' 'INFO' `
+            ("{0} old redist file(s) left in Citrix bootstrapper folders, but no executable shares those directories, so nothing loads them: {1}" -f `
+                $inert.Count, (($inert | ForEach-Object { $_.Path }) -join '; '))
     } else {
-        Add-Result 'App-local runtime shim' 'INFO' "present (system v$sysV): $detail -- intentional workaround"
+        Add-Result 'App-local runtime shim' 'INFO' `
+            ("present (system v{0}): {1} -- not older than the system runtime" -f `
+                $sysV, (($copies | ForEach-Object { "$($_.Path)=$($_.Version)" }) -join '; '))
     }
 }
 
@@ -656,8 +693,48 @@ function Get-CrashDetail {
         if (-not $d.Module     -and $m -match 'Faulting module name:\s*([^,\r\n]+)')      { $d.Module = $Matches[1].Trim() }
         if (-not $d.ModulePath -and $m -match 'Faulting module path:\s*([^\r\n]+)')       { $d.ModulePath = $Matches[1].Trim() }
         if (-not $d.Code       -and $m -match 'Exception code:\s*(0x[0-9a-fA-F]+)')       { $d.Code = $Matches[1].Trim() }
+        # The versions matter as much as the names: the module version is what
+        # proves whether a crash predates the repair, so it needs a fallback of
+        # its own rather than riding on the properties being readable.
+        if (-not $d.ModuleVersion -and $m -match 'Faulting module name:[^,\r\n]+,\s*version:\s*([^,\r\n]+)') {
+            $d.ModuleVersion = $Matches[1].Trim()
+        }
+        if (-not $d.AppVersion -and $m -match 'Faulting application name:[^,\r\n]+,\s*version:\s*([^,\r\n]+)') {
+            $d.AppVersion = $Matches[1].Trim()
+        }
     }
+    # The properties render the code bare ("c0000005"); prefix it so the log
+    # shows the same form the Citrix and Microsoft articles use.
+    if ($d.Code -match '^[0-9a-fA-F]{8}$') { $d.Code = "0x$($d.Code)" }
     return [pscustomobject]$d
+}
+
+function Get-ModuleVersionCandidate {
+    # Versions of a module present on disk NOW at the path a crash recorded.
+    # A 32-bit process reports its DLLs as loading from System32 even though
+    # WOW64 redirected it to SysWOW64 -- HCDL-B14YRW3 logged
+    # C:\Windows\SYSTEM32\MSVCP140.dll v14.22 for wfcrun32.exe, a 32-bit
+    # process. Rather than guess the bitness, return both system directories
+    # and let the caller require them to agree.
+    param([Parameter(Mandatory)][string]$Path)
+
+    $paths = @($Path)
+    $sys = (Join-Path $env:SystemRoot 'System32').TrimEnd('\')
+    $wow = (Join-Path $env:SystemRoot 'SysWOW64').TrimEnd('\')
+    $leaf = Split-Path -Leaf $Path
+    $dir  = (Split-Path -Parent $Path)
+    if ($dir -and $leaf) {
+        $dir = $dir.TrimEnd('\')
+        if     ($dir -ieq $sys) { $paths += (Join-Path $wow $leaf) }
+        elseif ($dir -ieq $wow) { $paths += (Join-Path $sys $leaf) }
+    }
+    $out = @()
+    foreach ($p in ($paths | Select-Object -Unique)) {
+        if (-not (Test-Path -LiteralPath $p)) { continue }
+        $v = ConvertTo-VersionOrNull (Get-Item -LiteralPath $p -ErrorAction SilentlyContinue).VersionInfo.FileVersion
+        if ($v) { $out += $v }
+    }
+    return $out
 }
 
 function Test-RecentCrashes {
@@ -715,27 +792,50 @@ function Test-RecentCrashes {
     $category = if ($private) { 'shim' } elseif (-not $runtimeOk) { 'prereq' } else { '' }
 
     # A crash that happened BEFORE the runtime was repaired is history, not a
-    # live fault -- but it stays in the event log for the whole lookback window.
-    # Without this, a machine fixed at 11:54 keeps reporting FAIL until the next
-    # day, which in WS1 means a successful remediation shows red for 24 hours.
-    # The runtime DLL's write time is when the repair landed, so crashes older
-    # than it are pre-repair. Only downgrade when the runtime now actually
-    # passes; if it is still below minimum the crashes are current and it stays
-    # a FAIL.
-    $runtimeOk = (Test-RuntimeOk -Kind 'vcx86') -and (Test-RuntimeOk -Kind 'vcx64')
-    $repairedAt = @(
-        (Join-Path (Join-Path $env:SystemRoot 'SysWOW64') 'msvcp140.dll'),
-        (Join-Path (Join-Path $env:SystemRoot 'System32') 'msvcp140.dll')
-    ) | Where-Object { Test-Path -LiteralPath $_ } |
-        ForEach-Object { (Get-Item -LiteralPath $_).LastWriteTime } |
-        Sort-Object -Descending | Select-Object -First 1
+    # live fault -- but it stays in the event log for the whole lookback window,
+    # so without this a successful remediation shows red in WS1 for 24 hours.
+    #
+    # Prove it from the events themselves. Event 1000 records the VERSION of the
+    # module that faulted; if every copy of that module on disk today is newer,
+    # the machine is no longer running the DLL that crashed and the fault cannot
+    # recur as recorded.
+    #
+    # This is deliberately not judged by the DLL's LastWriteTime any more.
+    # Installers routinely preserve a file's original build timestamp, so a
+    # runtime repaired this morning can carry a write time from years earlier.
+    # HCDL-B14YRW3 proved it: wfcrun32.exe faulted in MSVCP140.dll v14.22.27821.0
+    # at 11:54, the same path held v14.44.35211.0 by 12:45, and the timestamp
+    # rule still reported the crash as live.
+    $evidence = @()
+    foreach ($d in $details) {
+        if (-not $d.ModulePath -or -not $d.ModuleVersion) { continue }
+        $was = ConvertTo-VersionOrNull $d.ModuleVersion
+        if (-not $was) { continue }
+        $now = @(Get-ModuleVersionCandidate -Path $d.ModulePath)
+        if (-not $now) { continue }
+        # Every candidate must be newer. If one architecture still carries the
+        # old build, the fault can still happen and this proves nothing.
+        if (@($now | Where-Object { $_ -le $was }).Count -eq 0) {
+            $evidence += [pscustomobject]@{
+                Time = $d.Time; Module = $d.Module; Was = $was
+                Now = (($now | Sort-Object -Unique) -join '/')
+            }
+        }
+    }
 
-    $newest = ($events | Sort-Object TimeCreated -Descending | Select-Object -First 1).TimeCreated
-    if ($runtimeOk -and $repairedAt -and $newest -lt $repairedAt) {
+    # The latest crash we can prove was superseded also dates the repair: it
+    # happened after that crash. Anything at or before that moment is therefore
+    # pre-repair too, which covers the collateral faults -- SelfService dying in
+    # coreclr.dll minutes earlier is the same stale runtime, and .NET Core links
+    # against the VC++ redist, so it never records a version of its own to test.
+    $proven = $evidence | Sort-Object Time -Descending | Select-Object -First 1
+    $newest = ($details | Sort-Object Time -Descending | Select-Object -First 1).Time
+
+    if ($runtimeOk -and $proven -and $newest -le $proven.Time) {
         Add-Result "Citrix crashes (last ${EventHours}h)" 'WARN' `
-            ("{0} crash event(s) [{1}], all BEFORE the runtime was repaired at {2:yyyy-MM-dd HH:mm} -- historical, not a live fault" -f `
-                $events.Count, ($mods -join ', '), $repairedAt) `
-            'Have a user launch a published app to confirm; the next run past the lookback window will clear this.'
+            ("{0} crash event(s) [{1}], newest {2:HH:mm:ss} -- all pre-repair: {3} faulted at v{4} and every copy on disk is now v{5}" -f `
+                $details.Count, ($mods -join ', '), $newest, $proven.Module, $proven.Was, $proven.Now) `
+            'Historical, not a live fault. Have a user launch a published app to confirm; the next run past the lookback window clears this by itself.'
         return
     }
     Add-Result "Citrix crashes (last ${EventHours}h)" 'FAIL' `
@@ -1084,6 +1184,12 @@ function Remove-StaleShim {
     foreach ($c in (Get-AppLocalRuntimeCopy)) {
         if (-not $c.Version -or $c.Version -ge $sysV) {
             Write-Log "  keeping $($c.Path) (v$($c.Version), not older than system v$sysV)"
+            continue
+        }
+        if ($c.Exes.Count -eq 0) {
+            # Nothing in that directory can load it, so deleting it fixes
+            # nothing and only churns the install footprint.
+            Write-Log "  keeping $($c.Path) (no executable in that folder loads it)"
             continue
         }
         try { Remove-Item -LiteralPath $c.Path -Force -ErrorAction Stop
