@@ -90,8 +90,14 @@
 
 .NOTES
     Author  : MEB -- Oak Street Health / CVS Health IT Operations
-    Version : 1.5.0
-    Date    : 2026-08-21
+    Version : 1.6.0
+    Date    : 2026-08-31
+    v1.6.0  : Do not report a repaired machine as failing on historical
+              crashes. HCDL-B14YRW3 was fixed at 11:54 and still reported FAIL
+              afterwards, because every crash in the 24h lookback predated the
+              repair. Crashes older than the runtime DLL's write time are now
+              WARN ("historical"), but only when the runtime actually passes --
+              if it is still below minimum they remain a FAIL.
     v1.5.0  : Grade the per-user .ica UserChoice by WHAT it points at. One
               pointing at the repaired ProgID is fine; one pointing at the
               advertised ProgID is a FAIL, because it outranks the machine
@@ -132,7 +138,7 @@ param(
     [switch]$Quiet
 )
 
-$ScriptVersion     = '1.5.0'
+$ScriptVersion     = '1.6.0'
 $DestinationFolder = 'C:\drop\citrix'
 $LogRetainDays     = 30
 
@@ -536,6 +542,31 @@ function Test-RecentCrashes {
     $remedy = if ($mods -match 'MSVCP140|VCRUNTIME140') { 'Install-CitrixPrerequisites.ps1 -- crashes in the VC++ runtime mean it is below CWA minimum' }
               elseif ($mods -match 'coreclr') { 'Install-CitrixPrerequisites.ps1 -- check the .NET Desktop Runtime' }
               else { 'Review C:\Program Files (x86)\Citrix\Logs and %TEMP%\CTXWorkspaceInstallLogs' }
+
+    # A crash that happened BEFORE the runtime was repaired is history, not a
+    # live fault -- but it stays in the event log for the whole lookback window.
+    # Without this, a machine fixed at 11:54 keeps reporting FAIL until the next
+    # day, which in WS1 means a successful remediation shows red for 24 hours.
+    # The runtime DLL's write time is when the repair landed, so crashes older
+    # than it are pre-repair. Only downgrade when the runtime now actually
+    # passes; if it is still below minimum the crashes are current and it stays
+    # a FAIL.
+    $runtimeOk = (Test-RuntimeOk -Kind 'vcx86') -and (Test-RuntimeOk -Kind 'vcx64')
+    $repairedAt = @(
+        (Join-Path (Join-Path $env:SystemRoot 'SysWOW64') 'msvcp140.dll'),
+        (Join-Path (Join-Path $env:SystemRoot 'System32') 'msvcp140.dll')
+    ) | Where-Object { Test-Path -LiteralPath $_ } |
+        ForEach-Object { (Get-Item -LiteralPath $_).LastWriteTime } |
+        Sort-Object -Descending | Select-Object -First 1
+
+    $newest = ($events | Sort-Object TimeCreated -Descending | Select-Object -First 1).TimeCreated
+    if ($runtimeOk -and $repairedAt -and $newest -lt $repairedAt) {
+        Add-Result "Citrix crashes (last ${EventHours}h)" 'WARN' `
+            ("{0} crash event(s) [{1}], all BEFORE the runtime was repaired at {2:yyyy-MM-dd HH:mm} -- historical, not a live fault" -f `
+                $events.Count, ($mods -join ', '), $repairedAt) `
+            'Have a user launch a published app to confirm; the next run past the lookback window will clear this.'
+        return
+    }
     Add-Result "Citrix crashes (last ${EventHours}h)" 'FAIL' `
         ("{0} crash event(s); faulting module(s): {1}" -f $events.Count, ($mods -join ', ')) $remedy 'prereq'
 }
