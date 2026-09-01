@@ -105,8 +105,11 @@ every cumulative update. WS1 also needs **exit 0 AND non-empty STDOUT** — exit
 alone reads as not detected. → `Detect-CitrixWorkspace.ps1`
 
 **9. Stores wiped by a clean reinstall.**
-Everything verifies correctly but users land on "Add Account". Confirm GPO/WS1
-re-pushes the StoreFront URL before relying on `-CleanInstall` or a full wipe.
+Everything verifies correctly but users land on "Add Account". Only relevant
+where stores are configured at all — this site launches from the StoreFront web
+page, so `Test-CitrixHealth.ps1` reports an empty store list as INFO and never
+warns. If you do rely on configured stores, confirm GPO/WS1 re-pushes the
+StoreFront URL before using `-CleanInstall` or a full wipe.
 
 ## Cautions
 

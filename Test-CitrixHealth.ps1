@@ -83,11 +83,9 @@
     Citrix.Workspace, which is the Current Release track.
 
 .PARAMETER WebLaunchOnly
-    Treat an unconfigured store as expected rather than a warning. Set this
-    when users launch published apps from the StoreFront/Epic web page and the
-    Workspace app only runs the downloaded .ica -- in that model no store is
-    ever configured, and the launch path depends on the .ica association and
-    the receiver:// handler, both of which are checked separately.
+    Accepted and ignored. Web launch is now the assumed model, so an
+    unconfigured store never warns and the switch has nothing left to turn on.
+    It is kept only so existing WS1 command lines that pass it keep working.
 
 .PARAMETER EventHours
     How far back to look for crash events. Default 24.
@@ -97,8 +95,28 @@
 
 .NOTES
     Author  : MEB -- Oak Street Health / CVS Health IT Operations
-    Version : 1.9.0
-    Date    : 2026-08-31
+    Version : 1.10.0
+    Date    : 2026-09-01
+    v1.10.0 : Stores are never warned about. This site does not configure them
+              -- users launch from the web page and the client just runs the
+              downloaded .ica -- so an empty store list is the intended state
+              and is now reported as INFO unconditionally. -WebLaunchOnly is
+              accepted and ignored, so command lines already passing it keep
+              working.
+              Also: an app-local runtime copy is only a problem where it shadows an
+              executable on the LAUNCH path. OSHCDQ04PG4 -- a clean machine --
+              warned about the redist CWA 2507 bundles (14.42) sitting in its
+              own bootstrapper folder beside CWAInstaller.exe,
+              bootstrapperhelper.exe and DotNetCoreInstaller.exe. Those run at
+              install time and had already run against that very copy; they
+              cannot affect a published app launching. Since every patched
+              machine ends up with a system runtime newer than the bundled one,
+              that warning would have fired fleet-wide, forever, on endpoints
+              with nothing wrong -- the same noise -WebLaunchOnly removed.
+              Now WARN only when a launch binary (wfcrun32, wfica32,
+              SelfService, CDViewer, AuthManSvr, WebHelper, Receiver, concentr)
+              shares the directory; installer-only folders report INFO and
+              -Fix leaves them alone.
     v1.9.0  : Decide "already repaired" from the crash event, not a timestamp.
               HCDL-B14YRW3 kept reporting FAIL after a successful repair: the
               12:45 run showed wfcrun32.exe had faulted at 11:54 in MSVCP140.dll
@@ -184,7 +202,7 @@ param(
     [switch]$Quiet
 )
 
-$ScriptVersion     = '1.9.0'
+$ScriptVersion     = '1.10.0'
 $DestinationFolder = 'C:\drop\citrix'
 $LogRetainDays     = 30
 
@@ -307,6 +325,15 @@ function Test-CwaInstalled {
     }
     return $v
 }
+
+# The executables that run when a user launches a published app. Everything
+# else under the Citrix tree -- CWAInstaller.exe, bootstrapperhelper.exe,
+# DotNetCoreInstaller.exe -- only runs during install, so a stale DLL beside
+# THOSE cannot affect a launch.
+$script:CitrixLaunchExe = @(
+    'wfcrun32.exe', 'wfica32.exe', 'SelfService.exe', 'CDViewer.exe',
+    'AuthManSvr.exe', 'WebHelper.exe', 'Receiver.exe', 'concentr.exe'
+)
 
 function Test-CitrixBinaries {
     $roots = Get-CitrixRoots
@@ -508,21 +535,27 @@ function Test-AppLocalShim {
     $sysP = Join-Path (Join-Path $env:SystemRoot 'SysWOW64') 'msvcp140.dll'
     $sysV = if (Test-Path -LiteralPath $sysP) { ConvertTo-VersionOrNull (Get-Item -LiteralPath $sysP).VersionInfo.FileVersion } else { $null }
     $stale = @($copies | Where-Object { $sysV -and $_.Version -and $_.Version -lt $sysV })
-    # Only a copy sharing a directory with an executable can shadow the system
-    # runtime for that process. The rest are install leftovers.
-    $shadowing = @($stale | Where-Object { $_.Exes.Count -gt 0 })
-    $inert     = @($stale | Where-Object { $_.Exes.Count -eq 0 })
+    # A stale copy only matters where it shadows an executable on the LAUNCH
+    # path. Every CWA install leaves its bundled redist (14.42 for 2507) in the
+    # bootstrapper folder next to CWAInstaller.exe and friends, so any machine
+    # whose system runtime is newer -- which is every patched machine -- would
+    # otherwise raise this warning forever, on an endpoint with nothing wrong.
+    $shadowing = @($stale | Where-Object { @($_.Exes | Where-Object { $script:CitrixLaunchExe -contains $_ }).Count -gt 0 })
+    $installer = @($stale | Where-Object { $_ -notin $shadowing })
 
     if ($sysV -and $sysV -ge $MinVCRedist -and $shadowing) {
         Add-Result 'App-local runtime shim' 'WARN' `
-            ("{0} copy(ies) older than the system runtime v{1} sit beside an executable and outrank it there, and are never serviced: {2}" -f `
+            ("{0} copy(ies) older than the system runtime v{1} sit beside a launch executable and outrank it there, and are never serviced: {2}" -f `
                 $shadowing.Count, $sysV, `
-                (($shadowing | ForEach-Object { "$($_.Path)=$($_.Version) [loads for: $(($_.Exes | Select-Object -First 3) -join ', ')]" }) -join '; ')) `
+                (($shadowing | ForEach-Object { "$($_.Path)=$($_.Version) [loads for: $(($_.Exes | Where-Object { $script:CitrixLaunchExe -contains $_ } | Select-Object -First 3) -join ', ')]" }) -join '; ')) `
             'Delete them and re-test the launch (-Fix does this)' 'shim'
-    } elseif ($inert) {
+    } elseif ($installer) {
+        $near = @(($installer | ForEach-Object { $_.Exes }) | Sort-Object -Unique | Select-Object -First 4)
         Add-Result 'App-local runtime shim' 'INFO' `
-            ("{0} old redist file(s) left in Citrix bootstrapper folders, but no executable shares those directories, so nothing loads them: {1}" -f `
-                $inert.Count, (($inert | ForEach-Object { $_.Path }) -join '; '))
+            ("{0} older redist file(s) in Citrix install folders, beside {1} -- nothing on the launch path loads them: {2}" -f `
+                $installer.Count, `
+                $(if ($near) { "installer components only ($($near -join ', '))" } else { 'no executable at all' }), `
+                (($installer | ForEach-Object { $_.Path }) -join '; '))
     } else {
         Add-Result 'App-local runtime shim' 'INFO' `
             ("present (system v{0}): {1} -- not older than the system runtime" -f `
@@ -650,19 +683,14 @@ function Test-ConfiguredStores {
             if (Test-Path -LiteralPath $k) { $stores += (Get-ChildItem -LiteralPath $k -ErrorAction SilentlyContinue).PSChildName }
         }
     }
+    # This site does not configure stores at all: users launch from the
+    # StoreFront/Epic web page and the Workspace app only executes the .ica the
+    # browser downloads. An empty store list is therefore the intended state,
+    # not a defect, so it is reported and never warned about. What actually
+    # decides whether a web launch works -- the .ica association and the
+    # receiver:// handler -- is checked separately above.
     if ($stores) { Add-Result 'Configured stores' 'PASS' ("{0} store entr(ies)" -f $stores.Count) }
-    elseif ($WebLaunchOnly) {
-        # Deliberately unconfigured: users launch from the StoreFront/Epic web
-        # page and the Workspace app only executes the downloaded .ica. In that
-        # model no store is needed, so flagging it every run is noise. The
-        # things that DO matter for web launch -- the .ica association and the
-        # receiver:// handler -- are checked separately above.
-        Add-Result 'Configured stores' 'INFO' 'none, and none expected (-WebLaunchOnly): users launch from the web portal'
-    }
-    else {
-        Add-Result 'Configured stores' 'WARN' 'no store configured at machine or user level -- users will land on "Add Account"' `
-            'Confirm GPO/WS1 re-pushes the StoreFront URL, or pass -WebLaunchOnly if users launch from the web portal instead'
-    }
+    else { Add-Result 'Configured stores' 'INFO' 'none configured, and none expected: users launch from the web portal' }
 }
 
 function Get-CrashDetail {
@@ -1186,10 +1214,12 @@ function Remove-StaleShim {
             Write-Log "  keeping $($c.Path) (v$($c.Version), not older than system v$sysV)"
             continue
         }
-        if ($c.Exes.Count -eq 0) {
-            # Nothing in that directory can load it, so deleting it fixes
-            # nothing and only churns the install footprint.
-            Write-Log "  keeping $($c.Path) (no executable in that folder loads it)"
+        if (@($c.Exes | Where-Object { $script:CitrixLaunchExe -contains $_ }).Count -eq 0) {
+            # Nothing on the launch path loads it, so deleting it fixes nothing.
+            # The Citrix installer components beside it ran fine against this
+            # very copy, and removing a file the bootstrapper shipped is a
+            # change to the install footprint with no upside.
+            Write-Log "  keeping $($c.Path) (no launch-path executable in that folder loads it)"
             continue
         }
         try { Remove-Item -LiteralPath $c.Path -Force -ErrorAction Stop
